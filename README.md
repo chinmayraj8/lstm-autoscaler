@@ -13,3 +13,10 @@ Built for Unisys Innovation Program 17.
 - lstm_autoscaler.ipynb — main project notebook
 - outputs/ — all generated graphs
 
+
+## Dataset
+Download machine_usage_bigger.csv from:
+https://www.kaggle.com/datasets/akshatpandey01/alibaba-cluster-trace-2018
+
+Place it in the root project folder before running the notebook.
+
