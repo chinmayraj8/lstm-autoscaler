@@ -1,0 +1,349 @@
+"""
+Single-experiment pipeline for the LSTM autoscaler multi-seed harness.
+
+Every hyperparameter is frozen to match lstm_autoscaler.ipynb exactly.
+The only variable is the random seed, which controls weight initialisation
+and any stochastic ops inside TensorFlow/NumPy. No model caching: the LSTM
+is always retrained from scratch.
+"""
+
+import os
+import time
+import warnings
+from dataclasses import dataclass, field
+from typing import List, Tuple
+
+import numpy as np
+import pandas as pd
+from sklearn.metrics import mean_absolute_error, mean_squared_error
+from sklearn.preprocessing import MinMaxScaler
+
+import tensorflow as tf
+from tensorflow.keras.callbacks import EarlyStopping, ModelCheckpoint
+from tensorflow.keras.layers import LSTM, Dense, Dropout
+from tensorflow.keras.models import Sequential
+from tensorflow.keras.optimizers import Adam
+
+warnings.filterwarnings("ignore")
+
+# ── Frozen hyperparameters (must match the notebook cell-for-cell) ───────────
+DATA_PATH = os.path.expanduser("~/Desktop/machine_usage_bigger.csv")
+DEMAND_SCALE = 20.0
+LOOKBACK_STEPS = 6
+HORIZON_STEPS = 3
+FEATURE_COL = "cpu_util_percent"
+TEST_RATIO = 0.2
+NROWS = 500_000
+
+LSTM_UNITS = 128
+DROPOUT_RATE = 0.2
+LEARNING_RATE = 0.001
+MAX_EPOCHS = 60
+BATCH_SIZE = 64
+VAL_SPLIT = 0.1
+ES_PATIENCE = 10
+
+DEC_SERVER_CAPACITY = 80.0
+DEC_MIN_SERVERS = 1
+DEC_MAX_SERVERS = 10
+DEC_OVER_WEIGHT = 1.0
+DEC_UNDER_WEIGHT = 20.0
+DEC_SCALE_STEP = 1
+SAFETY_MARGIN = 0.25
+
+SIM_INITIAL_SERVERS = 2
+SIM_SERVER_CAPACITY = 80.0
+SIM_STARTUP_DELAY = 1
+
+REACTIVE_UP_THRESHOLD = 80.0
+REACTIVE_DOWN_THRESHOLD = 30.0
+# ────────────────────────────────────────────────────────────────────────────
+
+
+@dataclass
+class DecisionConfig:
+    server_capacity_pct: float = DEC_SERVER_CAPACITY
+    min_servers: int = DEC_MIN_SERVERS
+    max_servers: int = DEC_MAX_SERVERS
+    over_prov_weight: float = DEC_OVER_WEIGHT
+    under_prov_weight: float = DEC_UNDER_WEIGHT
+    scale_step: int = DEC_SCALE_STEP
+
+
+@dataclass
+class SimConfig:
+    initial_servers: int = SIM_INITIAL_SERVERS
+    server_capacity: float = SIM_SERVER_CAPACITY
+    startup_delay_steps: int = SIM_STARTUP_DELAY
+
+
+@dataclass
+class SimMetrics:
+    sla_violations: int = 0
+    total_steps: int = 0
+    over_prov_steps: int = 0
+    under_prov_steps: int = 0
+    server_counts: List[int] = field(default_factory=list)
+    demand_trace: List[float] = field(default_factory=list)
+    capacity_trace: List[float] = field(default_factory=list)
+
+
+# ── Data helpers ─────────────────────────────────────────────────────────────
+
+def _pick_best_machine(df: pd.DataFrame) -> str:
+    return df["machine_id"].value_counts().idxmax()
+
+
+def _prepare_timeseries(df: pd.DataFrame, machine_id: str) -> pd.DataFrame:
+    mdf = df[df["machine_id"] == machine_id].copy()
+    mdf["time_stamp"] = pd.to_datetime(mdf["time_stamp"], unit="s")
+    mdf = mdf.set_index("time_stamp").sort_index()
+    mdf = mdf[["cpu_util_percent", "mem_util_percent"]]
+    mdf = mdf.resample("5min").mean()
+    mdf = mdf.ffill().dropna()
+    return mdf
+
+
+def _scale_and_split(ts: pd.DataFrame, feature: str, test_ratio: float):
+    values = ts[[feature]].values.astype(np.float32)
+    split = int(len(values) * (1 - test_ratio))
+    train_raw, test_raw = values[:split], values[split:]
+    scaler = MinMaxScaler(feature_range=(0, 1))
+    scaler.fit(train_raw)
+    return scaler.transform(train_raw), scaler.transform(test_raw), scaler
+
+
+def _make_sequences(data: np.ndarray, lookback: int, horizon: int):
+    X, y = [], []
+    for i in range(len(data) - lookback - horizon + 1):
+        X.append(data[i : i + lookback])
+        y.append(data[i + lookback : i + lookback + horizon, 0])
+    return np.array(X, dtype=np.float32), np.array(y, dtype=np.float32)
+
+
+# ── Model helpers ─────────────────────────────────────────────────────────────
+
+def _build_lstm_model(lookback: int, horizon: int) -> tf.keras.Model:
+    model = Sequential([
+        LSTM(LSTM_UNITS, return_sequences=True, input_shape=(lookback, 1)),
+        Dropout(DROPOUT_RATE),
+        LSTM(LSTM_UNITS, return_sequences=False),
+        Dropout(DROPOUT_RATE),
+        Dense(horizon),
+    ])
+    model.compile(optimizer=Adam(learning_rate=LEARNING_RATE), loss="mse")
+    return model
+
+
+def _inv(arr: np.ndarray, scaler: MinMaxScaler) -> np.ndarray:
+    out = np.zeros_like(arr)
+    for h in range(arr.shape[1]):
+        out[:, h] = scaler.inverse_transform(arr[:, h].reshape(-1, 1)).flatten()
+    return out
+
+
+def _evaluate_lstm(model, X_test, y_test, scaler):
+    y_pred_scaled = model.predict(X_test, verbose=0)
+    y_pred_real = _inv(y_pred_scaled, scaler)
+    y_test_real = _inv(y_test, scaler)
+    rmse = float(np.sqrt(mean_squared_error(y_test_real.flatten(), y_pred_real.flatten())))
+    mae = float(mean_absolute_error(y_test_real.flatten(), y_pred_real.flatten()))
+    return y_pred_real, y_test_real, rmse, mae
+
+
+def _evaluate_naive(X_test, y_test, scaler, horizon):
+    last_val = X_test[:, -1, 0]
+    y_naive_scaled = np.repeat(last_val[:, None], horizon, axis=1)
+    y_naive_real = _inv(y_naive_scaled, scaler)
+    y_test_real = _inv(y_test, scaler)
+    rmse = float(np.sqrt(mean_squared_error(y_test_real.flatten(), y_naive_real.flatten())))
+    mae = float(mean_absolute_error(y_test_real.flatten(), y_naive_real.flatten()))
+    return rmse, mae
+
+
+# ── Decision engine ───────────────────────────────────────────────────────────
+
+def _compute_penalty(n_servers: int, predicted_load: float, cfg: DecisionConfig) -> float:
+    total_cap = n_servers * cfg.server_capacity_pct
+    over_frac = max(0.0, total_cap - predicted_load) / 100.0
+    under_frac = max(0.0, predicted_load - total_cap) / 100.0
+    return cfg.over_prov_weight * over_frac + cfg.under_prov_weight * under_frac
+
+
+def _decide_scaling(current_servers: int, predicted_load: float, cfg: DecisionConfig) -> Tuple[str, int]:
+    candidates = {
+        "hold": current_servers,
+        "scale_up": min(current_servers + cfg.scale_step, cfg.max_servers),
+        "scale_down": max(current_servers - cfg.scale_step, cfg.min_servers),
+    }
+    best = min(candidates, key=lambda a: _compute_penalty(candidates[a], predicted_load, cfg))
+    new_n = candidates[best]
+    if best == "scale_up":
+        return f"scale_up +{new_n - current_servers}", new_n
+    elif best == "scale_down":
+        return f"scale_down -{current_servers - new_n}", new_n
+    return "hold", new_n
+
+
+def _build_lstm_targets(
+    y_pred_real, y_test_real, dec_cfg, sim_cfg, demand_scale, safety_margin=SAFETY_MARGIN
+):
+    targets = []
+    current_servers = sim_cfg.initial_servers
+    for i in range(len(y_pred_real)):
+        planned_load = float(np.max(y_pred_real[i])) * demand_scale * (1.0 + safety_margin)
+        _, new_target = _decide_scaling(current_servers, planned_load, dec_cfg)
+        targets.append(new_target)
+        current_servers = new_target
+    demand = y_test_real[:, 0] * demand_scale
+    return np.array(targets), demand
+
+
+# ── Simulation ────────────────────────────────────────────────────────────────
+
+def _run_simulation(
+    demand_series: np.ndarray, target_series: np.ndarray, sim_cfg: SimConfig
+) -> SimMetrics:
+    metrics = SimMetrics()
+    active = sim_cfg.initial_servers
+    pending: List[Tuple[int, int]] = []
+
+    for demand, target in zip(demand_series, target_series):
+        next_pending = []
+        for n, ticks in pending:
+            ticks -= 1
+            if ticks <= 0:
+                active += n
+            else:
+                next_pending.append((n, ticks))
+        pending = next_pending
+
+        needed = int(target)
+        if needed > active:
+            pending.append((needed - active, sim_cfg.startup_delay_steps))
+        elif needed < active:
+            active = max(1, needed)
+
+        total_cap = active * sim_cfg.server_capacity
+
+        if demand > total_cap:
+            metrics.sla_violations += 1
+            metrics.under_prov_steps += 1
+
+        if total_cap > demand * 2.0:
+            metrics.over_prov_steps += 1
+
+        metrics.total_steps += 1
+        metrics.server_counts.append(active)
+        metrics.demand_trace.append(demand)
+        metrics.capacity_trace.append(total_cap)
+
+    return metrics
+
+
+def _compute_cost_score(metrics: SimMetrics, cfg: DecisionConfig) -> float:
+    n = metrics.total_steps
+    over_cost = cfg.over_prov_weight * (metrics.over_prov_steps / n)
+    under_cost = cfg.under_prov_weight * (metrics.under_prov_steps / n)
+    return round(over_cost + under_cost, 6)
+
+
+def _reactive_autoscaler(demand_series, sim_cfg):
+    active = sim_cfg.initial_servers
+    targets = []
+    for demand in demand_series:
+        load_per_server = demand / active
+        if load_per_server > REACTIVE_UP_THRESHOLD:
+            active = min(active + 1, 10)
+        elif load_per_server < REACTIVE_DOWN_THRESHOLD:
+            active = max(active - 1, 1)
+        targets.append(active)
+    return np.array(targets)
+
+
+# ── Public API ────────────────────────────────────────────────────────────────
+
+def run_single_experiment(seed: int) -> dict:
+    """Run the full pipeline from scratch for one seed and return all metrics."""
+    np.random.seed(seed)
+    tf.random.set_seed(seed)
+
+    # 1. Data
+    df_raw = pd.read_csv(
+        DATA_PATH,
+        nrows=NROWS,
+        usecols=["machine_id", "time_stamp", "cpu_util_percent", "mem_util_percent"],
+    )
+    best_machine = _pick_best_machine(df_raw)
+    ts = _prepare_timeseries(df_raw, best_machine)
+
+    # 2. Preprocessing
+    train_data, test_data, scaler = _scale_and_split(ts, FEATURE_COL, TEST_RATIO)
+    X_train, y_train = _make_sequences(train_data, LOOKBACK_STEPS, HORIZON_STEPS)
+    X_test, y_test = _make_sequences(test_data, LOOKBACK_STEPS, HORIZON_STEPS)
+
+    # 3. LSTM training (always from scratch)
+    lstm_model = _build_lstm_model(LOOKBACK_STEPS, HORIZON_STEPS)
+
+    exp_dir = os.path.dirname(os.path.abspath(__file__))
+    model_path = os.path.join(exp_dir, f"_tmp_model_seed_{seed}.keras")
+
+    early_stop = EarlyStopping(
+        monitor="val_loss", patience=ES_PATIENCE, restore_best_weights=True, verbose=0
+    )
+    checkpoint = ModelCheckpoint(model_path, monitor="val_loss", save_best_only=True, verbose=0)
+
+    t0 = time.time()
+    history = lstm_model.fit(
+        X_train, y_train,
+        epochs=MAX_EPOCHS,
+        batch_size=BATCH_SIZE,
+        validation_split=VAL_SPLIT,
+        callbacks=[early_stop, checkpoint],
+        verbose=0,
+    )
+    wall_clock_secs = time.time() - t0
+    epochs_trained = len(history.history["loss"])
+
+    if os.path.exists(model_path):
+        os.remove(model_path)
+
+    # 4. LSTM evaluation
+    y_pred_real, y_test_real, lstm_rmse, lstm_mae = _evaluate_lstm(
+        lstm_model, X_test, y_test, scaler
+    )
+
+    # 5. Naive persistence baseline
+    naive_rmse, naive_mae = _evaluate_naive(X_test, y_test, scaler, HORIZON_STEPS)
+
+    # 6. Simulations
+    dec_cfg = DecisionConfig()
+    sim_cfg = SimConfig()
+
+    lstm_targets, demand_series = _build_lstm_targets(
+        y_pred_real, y_test_real, dec_cfg, sim_cfg, DEMAND_SCALE
+    )
+    lstm_metrics = _run_simulation(demand_series, lstm_targets, sim_cfg)
+
+    reactive_targets = _reactive_autoscaler(demand_series, sim_cfg)
+    reactive_metrics = _run_simulation(demand_series, reactive_targets, sim_cfg)
+
+    # 7. Cost scores
+    lstm_cost = _compute_cost_score(lstm_metrics, dec_cfg)
+    reactive_cost = _compute_cost_score(reactive_metrics, dec_cfg)
+
+    n = lstm_metrics.total_steps
+    return {
+        "seed": seed,
+        "lstm_forecast_rmse": round(lstm_rmse, 6),
+        "lstm_forecast_mae": round(lstm_mae, 6),
+        "naive_baseline_rmse": round(naive_rmse, 6),
+        "lstm_sla_violation_rate_pct": round(lstm_metrics.sla_violations / n * 100, 4),
+        "reactive_sla_violation_rate_pct": round(reactive_metrics.sla_violations / n * 100, 4),
+        "lstm_over_prov_waste_pct": round(lstm_metrics.over_prov_steps / n * 100, 4),
+        "reactive_over_prov_waste_pct": round(reactive_metrics.over_prov_steps / n * 100, 4),
+        "lstm_cost_score": lstm_cost,
+        "reactive_cost_score": reactive_cost,
+        "epochs_trained": epochs_trained,
+        "wall_clock_secs": round(wall_clock_secs, 1),
+    }
