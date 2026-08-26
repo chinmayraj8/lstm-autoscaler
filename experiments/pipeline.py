@@ -308,20 +308,28 @@ def _reactive_autoscaler(demand_series, sim_cfg,
 
 # ── Data loading (shared by tuning and experiment runs) ───────────────────────
 
-def _load_and_prepare():
-    df_raw = pd.read_csv(
-        DATA_PATH,
-        nrows=NROWS,
-        usecols=["machine_id", "time_stamp", "cpu_util_percent", "mem_util_percent"],
-    )
-    best_machine = _pick_best_machine(df_raw)
-    ts = _prepare_timeseries(df_raw, best_machine)
-    return ts
+def _load_and_prepare(machine_id=None, nrows=NROWS, df_raw=None):
+    """Load data and prepare time-series for one machine.
+
+    Accepts a pre-loaded df_raw to avoid redundant CSV reads when calling
+    this for many machines in a loop.  Returns (ts, machine_id_used).
+    """
+    if df_raw is None:
+        df_raw = pd.read_csv(
+            DATA_PATH,
+            nrows=nrows,
+            usecols=["machine_id", "time_stamp", "cpu_util_percent", "mem_util_percent"],
+        )
+    if machine_id is None:
+        machine_id = _pick_best_machine(df_raw)
+    ts = _prepare_timeseries(df_raw, machine_id)
+    return ts, machine_id
 
 
 # ── Public API ────────────────────────────────────────────────────────────────
 
-def tune_on_validation(seed: int = 42) -> dict:
+def tune_on_validation(seed: int = 42, machine_id=None, nrows=NROWS,
+                       df_raw=None) -> dict:
     """Grid-search both policies on the validation split only.
 
     Returns a dict with the best params for Reactive and for the LSTM
@@ -331,7 +339,7 @@ def tune_on_validation(seed: int = 42) -> dict:
     np.random.seed(seed)
     tf.random.set_seed(seed)
 
-    ts = _load_and_prepare()
+    ts, machine_id = _load_and_prepare(machine_id, nrows, df_raw)
     train_data, val_data, _, scaler = _split_three_way(ts, FEATURE_COL)
 
     X_train, y_train = _make_sequences(train_data, LOOKBACK_STEPS, HORIZON_STEPS)
@@ -390,14 +398,15 @@ def tune_on_validation(seed: int = 42) -> dict:
                 best_upw, best_sm = upw, sm
 
     return {
-        "reactive_up":          best_up,
-        "reactive_down":        best_down,
-        "reactive_val_cost":    round(best_reactive_cost, 6),
+        "machine_id":             machine_id,
+        "reactive_up":            best_up,
+        "reactive_down":          best_down,
+        "reactive_val_cost":      round(best_reactive_cost, 6),
         "lstm_under_prov_weight": best_upw,
-        "lstm_safety_margin":   best_sm,
-        "lstm_val_cost":        round(best_lstm_cost, 6),
-        "reactive_grid":        reactive_grid_results,
-        "lstm_grid":            lstm_grid_results,
+        "lstm_safety_margin":     best_sm,
+        "lstm_val_cost":          round(best_lstm_cost, 6),
+        "reactive_grid":          reactive_grid_results,
+        "lstm_grid":              lstm_grid_results,
     }
 
 
@@ -407,6 +416,9 @@ def run_single_experiment(
     safety_margin:     float = SAFETY_MARGIN,
     reactive_up:       float = REACTIVE_UP_THRESHOLD,
     reactive_down:     float = REACTIVE_DOWN_THRESHOLD,
+    machine_id=None,
+    nrows=NROWS,
+    df_raw=None,
 ) -> dict:
     """Run the full pipeline for one seed, evaluate on the TEST split only.
 
@@ -416,7 +428,7 @@ def run_single_experiment(
     np.random.seed(seed)
     tf.random.set_seed(seed)
 
-    ts = _load_and_prepare()
+    ts, machine_id = _load_and_prepare(machine_id, nrows, df_raw)
     train_data, _, test_data, scaler = _split_three_way(ts, FEATURE_COL)
 
     X_train, y_train = _make_sequences(train_data, LOOKBACK_STEPS, HORIZON_STEPS)
