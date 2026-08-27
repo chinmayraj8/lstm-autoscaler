@@ -1,0 +1,8 @@
+__pycache__/
+*.py[cod]
+*.pyo
+.DS_Store
+venv/
+.ipynb_checkpoints/
+_to_delete/
+experiments/_tmp_*.keras
