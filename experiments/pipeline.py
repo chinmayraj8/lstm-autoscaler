@@ -33,7 +33,8 @@ warnings.filterwarnings("ignore")
 
 # ── Frozen constants ──────────────────────────────────────────────────────────
 DATA_PATH = os.path.expanduser("~/Desktop/machine_usage_bigger.csv")
-DEMAND_SCALE = 20.0
+DEMAND_SCALE = 20.0           # kept for backward compat with Steps 1-3 scripts
+TARGET_MEAN_LOAD_PCT = 115.0  # per-machine calibration target: mean aggregate demand
 LOOKBACK_STEPS = 6
 HORIZON_STEPS = 3
 FEATURE_COL = "cpu_util_percent"
@@ -71,6 +72,41 @@ _REACTIVE_DOWN_GRID = [10, 15, 20, 25, 30, 35, 40]
 _LSTM_UPW_GRID      = [5, 10, 15, 20, 25, 30, 40]
 _LSTM_SM_GRID       = [0.05, 0.10, 0.15, 0.20, 0.25, 0.30, 0.35, 0.40]
 # ────────────────────────────────────────────────────────────────────────────
+
+
+# ── Demand-scale calibration helpers ─────────────────────────────────────────
+
+def calibrate_demand_scale(machine_mean_cpu: float,
+                           target_mean_load_pct: float = TARGET_MEAN_LOAD_PCT) -> float:
+    """Return a demand scale so mean aggregate demand == target_mean_load_pct.
+
+    Uses the full resampled series mean — this is a normalisation constant,
+    not a tunable hyperparameter.
+    """
+    return target_mean_load_pct / machine_mean_cpu
+
+
+def check_feasibility(ts: pd.DataFrame, demand_scale: float,
+                      max_servers: int = DEC_MAX_SERVERS,
+                      server_capacity: float = SIM_SERVER_CAPACITY) -> dict:
+    """Return feasibility stats for a machine at the given demand_scale.
+
+    Infeasible when p99 calibrated demand > max fleet capacity.  In that
+    regime both policies fail structurally (capacity ceiling), not because of
+    forecasting quality, so the machine should be skipped or re-scaled.
+    """
+    cpu     = ts[FEATURE_COL].values * demand_scale
+    max_cap = max_servers * server_capacity
+    p99     = float(np.percentile(cpu, 99))
+    return {
+        "demand_mean":   round(float(cpu.mean()), 2),
+        "demand_p95":    round(float(np.percentile(cpu, 95)), 2),
+        "demand_p99":    round(p99, 2),
+        "max_fleet_cap": max_cap,
+        "infeasible":    p99 > max_cap,
+        "reason":        (f"p99 {p99:.1f}% > max fleet {max_cap:.0f}%"
+                          if p99 > max_cap else "OK"),
+    }
 
 
 @dataclass
@@ -329,7 +365,7 @@ def _load_and_prepare(machine_id=None, nrows=NROWS, df_raw=None):
 # ── Public API ────────────────────────────────────────────────────────────────
 
 def tune_on_validation(seed: int = 42, machine_id=None, nrows=NROWS,
-                       df_raw=None) -> dict:
+                       df_raw=None, demand_scale: float = DEMAND_SCALE) -> dict:
     """Grid-search both policies on the validation split only.
 
     Returns a dict with the best params for Reactive and for the LSTM
@@ -355,7 +391,7 @@ def tune_on_validation(seed: int = 42, machine_id=None, nrows=NROWS,
     y_pred_val, y_val_real, _, _ = _evaluate_lstm(lstm_model, X_val, y_val, scaler)
 
     # Demand on val for Reactive (uses actual, not predicted)
-    val_demand = y_val_real[:, 0] * DEMAND_SCALE
+    val_demand = y_val_real[:, 0] * demand_scale
 
     sim_cfg  = SimConfig()
     eval_cfg = DecisionConfig()   # fixed evaluation weights for Reactive search
@@ -388,7 +424,7 @@ def tune_on_validation(seed: int = 42, machine_id=None, nrows=NROWS,
         for sm in _LSTM_SM_GRID:
             dec_cfg = DecisionConfig(under_prov_weight=upw)
             targets, _ = _build_lstm_targets(
-                y_pred_val, y_val_real, dec_cfg, sim_cfg, DEMAND_SCALE, sm
+                y_pred_val, y_val_real, dec_cfg, sim_cfg, demand_scale, sm
             )
             metrics = _run_simulation(val_demand, targets, sim_cfg)
             cost    = _compute_cost_score(metrics, dec_cfg)
@@ -419,6 +455,7 @@ def run_single_experiment(
     machine_id=None,
     nrows=NROWS,
     df_raw=None,
+    demand_scale: float = DEMAND_SCALE,
 ) -> dict:
     """Run the full pipeline for one seed, evaluate on the TEST split only.
 
@@ -451,7 +488,7 @@ def run_single_experiment(
     sim_cfg = SimConfig()
 
     lstm_targets, demand_series = _build_lstm_targets(
-        y_pred_real, y_test_real, dec_cfg, sim_cfg, DEMAND_SCALE, safety_margin
+        y_pred_real, y_test_real, dec_cfg, sim_cfg, demand_scale, safety_margin
     )
     lstm_metrics = _run_simulation(demand_series, lstm_targets, sim_cfg)
 
