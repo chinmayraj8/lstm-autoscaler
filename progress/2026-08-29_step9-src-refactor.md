@@ -1,8 +1,7 @@
 # Step 9: src/ package extraction + pytest test suite
 Date: 2026-08-29
-Status: done (verified by real test execution + import-graph checks; full
-regression run against the real dataset/TensorFlow still pending -- see
-"Still open")
+Status: done -- fully verified, including a real training run on the real
+dataset/TensorFlow/GPU (see "Verification")
 
 ## What changed
 
@@ -100,15 +99,18 @@ different kinds of check were used:
 
 ## Still open
 
-- **No regression run against the real dataset/TensorFlow yet.** The
-  pure-logic tests above prove the decision engine, simulator, and
-  calibration math didn't change. They do NOT prove the LSTM training/
-  forecasting path still produces identical numbers, since that needs
-  real TensorFlow and `~/Desktop/machine_usage_bigger.csv`, neither of
-  which existed in the environment this refactor was built in. **Next:**
-  run `venv/bin/python -m pytest tests/ -v` and then
-  `venv/bin/python experiments/run_multiseed.py` (or any other `run_*.py`)
-  for real, and confirm the numbers match the existing results CSVs.
+- ~~No regression run against the real dataset/TensorFlow yet~~ --
+  **resolved same day.** Chinmay ran `pytest` (25/25 passed) and
+  `run_multiseed.py` on the real venv; `run_multiseed.py` turned out to
+  skip seeds already in `results.csv`, so as a follow-up he ran
+  `run_single_experiment(seed=999)` directly against `src.autoscaler` --
+  a genuine fresh LSTM train (18 epochs, Metal GPU, 7.4s) plus both
+  policies' simulation. Reactive's numbers (cost=0.134658,
+  SLA=0.4415%, over-prov=4.6358%) matched the historical values
+  **exactly**, as expected since Reactive is seed-independent. LSTM's
+  numbers (RMSE=0.581236, cost=0.04415) landed within normal seed-to-seed
+  variance of the existing 5-seed mean±std. No errors anywhere in the
+  path. The refactor is confirmed to not have changed behavior.
 - No tests yet for `run_multimachine.py`'s `_compute_machine_stats` /
   `_select_machines` (the K-means clustering helpers) — those weren't
   moved into the package this round, since they're specific to that one
