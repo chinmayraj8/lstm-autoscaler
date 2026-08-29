@@ -122,7 +122,8 @@ def _forecast_and_score(y_pred_scaled, y_true_scaled, scaler):
 
 def tune_arima_on_validation(seed: int = 42, machine_id=None, nrows=config.NROWS,
                               df_raw=None, demand_scale: float = config.DEMAND_SCALE,
-                              order=ARIMA_ORDER, target_builder=_build_lstm_targets) -> dict:
+                              order=ARIMA_ORDER, target_builder=_build_lstm_targets,
+                              horizon_weights_grid=None) -> dict:
     """Grid-search ARIMA's decision-engine params on validation only.
 
     Same grids, same objective (minimize validation cost score), same
@@ -137,6 +138,12 @@ def tune_arima_on_validation(seed: int = 42, machine_id=None, nrows=config.NROWS
     decision.py, Step 12, to tune the multi-step-aware engine on ARIMA's
     forecasts instead) -- same option `tune_on_validation` exposes for the
     LSTM, so both forecasters can be compared under either engine fairly.
+
+    `horizon_weights_grid` (Step 13): same optional third grid dimension
+    `tune_on_validation` exposes -- see its docstring for the exact
+    backward-compatibility contract (default `None` behaves identically to
+    before this parameter existed; `arima_grid`'s tuple shape only grows
+    from 3- to 4-tuples when 2+ candidates are actually passed).
     """
     ts, machine_id = _load_and_prepare(machine_id, nrows, df_raw)
     train_data, val_data, _, scaler = _split_three_way(ts, config.FEATURE_COL)
@@ -152,29 +159,36 @@ def tune_arima_on_validation(seed: int = 42, machine_id=None, nrows=config.NROWS
 
     sim_cfg = SimConfig()
 
+    multi_hw = horizon_weights_grid is not None and len(horizon_weights_grid) > 1
+    hw_candidates = horizon_weights_grid if horizon_weights_grid is not None else [None]
+
     best_cost = float("inf")
     best_upw = config.DEC_UNDER_WEIGHT
     best_sm = config.SAFETY_MARGIN
+    best_hw = None
     grid_results = []
 
     for upw in config.LSTM_UPW_GRID:
         for sm in config.LSTM_SM_GRID:
-            dec_cfg = DecisionConfig(under_prov_weight=upw)
-            targets, demand = target_builder(
-                y_pred_val, y_val_real, dec_cfg, sim_cfg, demand_scale, sm
-            )
-            metrics = _run_simulation(demand, targets, sim_cfg)
-            cost = _compute_cost_score(metrics, dec_cfg)
-            grid_results.append((upw, sm, cost))
-            if cost < best_cost:
-                best_cost = cost
-                best_upw, best_sm = upw, sm
+            for hw in hw_candidates:
+                dec_cfg = DecisionConfig(under_prov_weight=upw)
+                hw_kwargs = {} if hw is None else {"horizon_weights": np.asarray(hw)}
+                targets, demand = target_builder(
+                    y_pred_val, y_val_real, dec_cfg, sim_cfg, demand_scale, sm, **hw_kwargs
+                )
+                metrics = _run_simulation(demand, targets, sim_cfg)
+                cost = _compute_cost_score(metrics, dec_cfg)
+                grid_results.append((upw, sm, hw, cost) if multi_hw else (upw, sm, cost))
+                if cost < best_cost:
+                    best_cost = cost
+                    best_upw, best_sm, best_hw = upw, sm, hw
 
     return {
         "machine_id": machine_id,
         "arima_order": order,
         "arima_under_prov_weight": best_upw,
         "arima_safety_margin": best_sm,
+        "arima_horizon_weights": best_hw,
         "arima_val_cost": round(best_cost, 6),
         "arima_val_rmse": round(val_rmse, 6),
         "arima_val_mae": round(val_mae, 6),
@@ -192,6 +206,7 @@ def run_arima_experiment(
     demand_scale: float = config.DEMAND_SCALE,
     order=ARIMA_ORDER,
     target_builder=_build_lstm_targets,
+    horizon_weights=None,
 ) -> dict:
     """Run ARIMA through the full pipeline, evaluated on the TEST split only.
 
@@ -201,6 +216,9 @@ def run_arima_experiment(
     `safety_margin` must come from `tune_arima_on_validation` so test is
     never involved in tuning -- identical discipline to the LSTM path.
     `target_builder` must match whatever was used during tuning.
+    `horizon_weights` (Step 13): the winning candidate from
+    `tune_arima_on_validation`'s `horizon_weights_grid` (or `None`,
+    unchanged behavior).
 
     `seed` does not affect ARIMA's fit (see module docstring); it is kept
     in the signature and output only for schema symmetry with the LSTM
@@ -227,8 +245,9 @@ def run_arima_experiment(
     dec_cfg = DecisionConfig(under_prov_weight=under_prov_weight)
     sim_cfg = SimConfig()
 
+    hw_kwargs = {} if horizon_weights is None else {"horizon_weights": np.asarray(horizon_weights)}
     arima_targets, demand_series = target_builder(
-        y_pred_real, y_test_real, dec_cfg, sim_cfg, demand_scale, safety_margin
+        y_pred_real, y_test_real, dec_cfg, sim_cfg, demand_scale, safety_margin, **hw_kwargs
     )
     arima_metrics = _run_simulation(demand_series, arima_targets, sim_cfg)
     arima_cost = _compute_cost_score(arima_metrics, dec_cfg)

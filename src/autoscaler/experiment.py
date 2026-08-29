@@ -25,7 +25,8 @@ from .simulation import SimConfig, _compute_cost_score, _reactive_autoscaler, _r
 
 def tune_on_validation(seed: int = 42, machine_id=None, nrows=config.NROWS,
                        df_raw=None, demand_scale: float = config.DEMAND_SCALE,
-                       target_builder=_build_lstm_targets) -> dict:
+                       target_builder=_build_lstm_targets,
+                       horizon_weights_grid=None) -> dict:
     """Grid-search both policies on the validation split only.
 
     `target_builder` selects the decision engine the LSTM's grid search is
@@ -33,6 +34,19 @@ def tune_on_validation(seed: int = 42, machine_id=None, nrows=config.NROWS,
     (max-of-horizon). Pass `_build_multistep_targets` (decision.py, Step 12)
     to tune the multi-step-aware engine instead; same signature, same
     (targets, demand) return shape, so nothing else here needs to change.
+
+    `horizon_weights_grid` (Step 13): optional list of `horizon_weights`
+    arrays (or `None` for the target_builder's own default) to add as a
+    third grid dimension alongside `under_prov_weight`/`safety_margin` --
+    only meaningful for `_build_multistep_targets`, which is the only
+    target_builder that accepts `horizon_weights`. Left as `None` (the
+    default), behavior is byte-identical to before this parameter existed:
+    a single implicit candidate (`None`, i.e. the target_builder's own
+    default) is tried, and `lstm_grid` keeps its original 3-tuple
+    `(under_prov_weight, safety_margin, cost)` shape. Passing 2+ candidates
+    switches `lstm_grid` to 4-tuples `(under_prov_weight, safety_margin,
+    horizon_weights, cost)` instead -- callers that only care about the
+    default single-candidate behavior are unaffected either way.
 
     Returns a dict with the best params for Reactive and for the LSTM
     decision engine, plus their validation cost scores and which grid
@@ -81,23 +95,29 @@ def tune_on_validation(seed: int = 42, machine_id=None, nrows=config.NROWS,
                 best_up, best_down = up, down
 
     # ── Grid-search LSTM decision-engine params ───────────────────────────────
+    multi_hw = horizon_weights_grid is not None and len(horizon_weights_grid) > 1
+    hw_candidates = horizon_weights_grid if horizon_weights_grid is not None else [None]
+
     best_lstm_cost = float("inf")
     best_upw = config.DEC_UNDER_WEIGHT
     best_sm  = config.SAFETY_MARGIN
+    best_hw  = None
     lstm_grid_results = []
 
     for upw in config.LSTM_UPW_GRID:
         for sm in config.LSTM_SM_GRID:
-            dec_cfg = DecisionConfig(under_prov_weight=upw)
-            targets, _ = target_builder(
-                y_pred_val, y_val_real, dec_cfg, sim_cfg, demand_scale, sm
-            )
-            metrics = _run_simulation(val_demand, targets, sim_cfg)
-            cost    = _compute_cost_score(metrics, dec_cfg)
-            lstm_grid_results.append((upw, sm, cost))
-            if cost < best_lstm_cost:
-                best_lstm_cost = cost
-                best_upw, best_sm = upw, sm
+            for hw in hw_candidates:
+                dec_cfg = DecisionConfig(under_prov_weight=upw)
+                hw_kwargs = {} if hw is None else {"horizon_weights": np.asarray(hw)}
+                targets, _ = target_builder(
+                    y_pred_val, y_val_real, dec_cfg, sim_cfg, demand_scale, sm, **hw_kwargs
+                )
+                metrics = _run_simulation(val_demand, targets, sim_cfg)
+                cost    = _compute_cost_score(metrics, dec_cfg)
+                lstm_grid_results.append((upw, sm, hw, cost) if multi_hw else (upw, sm, cost))
+                if cost < best_lstm_cost:
+                    best_lstm_cost = cost
+                    best_upw, best_sm, best_hw = upw, sm, hw
 
     return {
         "machine_id":             machine_id,
@@ -106,6 +126,7 @@ def tune_on_validation(seed: int = 42, machine_id=None, nrows=config.NROWS,
         "reactive_val_cost":      round(best_reactive_cost, 6),
         "lstm_under_prov_weight": best_upw,
         "lstm_safety_margin":     best_sm,
+        "lstm_horizon_weights":   best_hw,
         "lstm_val_cost":          round(best_lstm_cost, 6),
         "reactive_grid":          reactive_grid_results,
         "lstm_grid":              lstm_grid_results,
@@ -123,6 +144,7 @@ def run_single_experiment(
     df_raw=None,
     demand_scale: float = config.DEMAND_SCALE,
     target_builder=_build_lstm_targets,
+    horizon_weights=None,
 ) -> dict:
     """Run the full pipeline for one seed, evaluate on the TEST split only.
 
@@ -130,7 +152,9 @@ def run_single_experiment(
     tune_on_validation) so the test split is never involved in tuning.
     `target_builder` must match whatever was used to produce
     `under_prov_weight`/`safety_margin` in tuning -- see tune_on_validation's
-    docstring.
+    docstring. `horizon_weights` (Step 13): the single winning candidate from
+    `tune_on_validation`'s `horizon_weights_grid` (or `None`, unchanged
+    behavior) -- only meaningful for `_build_multistep_targets`.
     """
     np.random.seed(seed)
     tf.random.set_seed(seed)
@@ -157,8 +181,9 @@ def run_single_experiment(
     dec_cfg = DecisionConfig(under_prov_weight=under_prov_weight)
     sim_cfg = SimConfig()
 
+    hw_kwargs = {} if horizon_weights is None else {"horizon_weights": np.asarray(horizon_weights)}
     lstm_targets, demand_series = target_builder(
-        y_pred_real, y_test_real, dec_cfg, sim_cfg, demand_scale, safety_margin
+        y_pred_real, y_test_real, dec_cfg, sim_cfg, demand_scale, safety_margin, **hw_kwargs
     )
     lstm_metrics = _run_simulation(demand_series, lstm_targets, sim_cfg)
 
