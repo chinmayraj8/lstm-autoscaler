@@ -1,0 +1,238 @@
+"""
+ARIMA baseline wired into the same decision engine + simulator as the LSTM
+and Reactive policies (Phase 2, Step 10).
+
+Step 6 (experiments/run_baselines_and_sweep.py) only ever compared ARIMA's
+point-forecast accuracy (RMSE/MAE) against the LSTM. It never ran ARIMA's
+forecasts through the autoscaler's decision engine or fleet simulator, so
+there was no cost-score / SLA-rate comparison -- ARIMA's actual autoscaling
+behavior was unknown. This module closes that gap by reusing:
+
+- The exact same rolling-forecast procedure as Step 6's `_evaluate_arima`
+  (fit on train only, advance state through val with `.append(refit=False)`,
+  roll horizon-step-ahead through the test window) -- generalized here to
+  also roll through the *validation* window, so ARIMA's decision-engine
+  params (under_prov_weight, safety_margin) can be tuned on validation
+  exactly like the LSTM's, never touching test until the final run.
+- `_build_lstm_targets` (decision.py) unchanged -- it only consumes a
+  (y_pred_real, y_actual_real) array pair of shape (n_sequences, horizon)
+  and has no LSTM-specific logic, so ARIMA's forecasts plug into it
+  directly. This is what guarantees ARIMA is judged on the identical
+  yardstick as the LSTM: same DecisionConfig, same SimConfig, same
+  `_run_simulation`, same `_compute_cost_score`.
+
+Deliberately NOT imported eagerly from `src.autoscaler/__init__.py` --
+statsmodels is a real dependency but there's no reason to pay its import
+cost for callers who only need the decision engine / simulator / LSTM path.
+Resolved lazily instead, same pattern as the TensorFlow-dependent names in
+`forecasting.py` and `experiment.py`.
+
+Determinism note (important for reporting)
+--------------------------------------------
+Unlike the LSTM (random weight init + internal validation split -> genuine
+seed-to-seed variance) and like the Reactive policy (no randomness at all),
+ARIMA's MLE fit via statsmodels is deterministic given the same data and
+order: same starting parameters (Hannan-Rissanen), same optimizer (L-BFGS-B),
+no random restarts. Running the same (machine, order) pair through
+`run_arima_experiment` twice reproduces bit-identical numbers -- there is no
+seed-driven distribution to report a mean±std over. `run_arima_experiment`
+still accepts a `seed` argument (for CSV-schema symmetry with the LSTM
+multi-seed harness) but does not use it for any randomness.
+"""
+
+import time
+import warnings
+
+import numpy as np
+from sklearn.metrics import mean_absolute_error, mean_squared_error
+from sklearn.preprocessing import MinMaxScaler
+
+from . import config
+from .data import _load_and_prepare, _split_three_way
+from .decision import DecisionConfig, _build_lstm_targets
+from .simulation import SimConfig, _compute_cost_score, _reactive_autoscaler, _run_simulation
+
+ARIMA_ORDER = (2, 0, 1)   # same order selected a priori in Step 6
+
+
+def _inv_flat(arr: np.ndarray, scaler: MinMaxScaler) -> np.ndarray:
+    """Inverse-transform a (n, horizon) scaled array back to real units.
+
+    Identical formula to forecasting._inv, duplicated here (rather than
+    imported) so this module never needs to import forecasting.py and, with
+    it, TensorFlow -- see module docstring.
+    """
+    out = np.zeros_like(arr)
+    for h in range(arr.shape[1]):
+        out[:, h] = scaler.inverse_transform(arr[:, h].reshape(-1, 1)).flatten()
+    return out
+
+
+def _arima_rolling_forecast(train_flat, context_flat, target_flat,
+                            lookback, horizon, order=ARIMA_ORDER):
+    """Roll ARIMA forecasts across `target_flat`, aligned with `_make_sequences`.
+
+    Fits on `train_flat` only (parameters estimated from train, matching the
+    scaler-fits-on-train-only convention used throughout this project).
+    Advances state through `context_flat` (if any) with `.append(refit=False)`
+    -- data the model has "seen" but that did not inform its parameters, e.g.
+    validation data when the target is test. Then advances through the first
+    `lookback` points of `target_flat` (to mirror the LSTM's lookback window:
+    those points are context, not something the model is scored on) and rolls
+    an horizon-step-ahead forecast through the rest, appending each true value
+    once revealed -- identical procedure to Step 6's `_evaluate_arima`.
+
+    Returns (y_pred_scaled, y_true_scaled), each shape (n_sequences, horizon),
+    in the same scaled [0, 1] space `_make_sequences` produces.
+    """
+    from statsmodels.tsa.arima.model import ARIMA
+
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        fit = ARIMA(train_flat, order=order).fit()
+        if len(context_flat) > 0:
+            fit = fit.append(context_flat, refit=False)
+        if lookback > 0 and len(target_flat) >= lookback:
+            fit = fit.append(target_flat[:lookback], refit=False)
+
+    n_sequences = len(target_flat) - lookback - horizon + 1
+    if n_sequences <= 0:
+        raise ValueError(f"Not enough data for lookback={lookback} horizon={horizon}")
+
+    y_pred_sc, y_true_sc = [], []
+    for i in range(n_sequences):
+        fc = fit.forecast(steps=horizon)
+        y_pred_sc.append(np.clip(fc, 0.0, 1.0))
+        y_true_sc.append(target_flat[i + lookback: i + lookback + horizon])
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            fit = fit.append([target_flat[i + lookback]], refit=False)
+
+    return np.array(y_pred_sc), np.array(y_true_sc)
+
+
+def _forecast_and_score(y_pred_scaled, y_true_scaled, scaler):
+    """Inverse-transform + RMSE/MAE, mirroring forecasting._evaluate_lstm's return shape."""
+    y_pred_real = _inv_flat(y_pred_scaled, scaler)
+    y_true_real = _inv_flat(y_true_scaled, scaler)
+    rmse = float(np.sqrt(mean_squared_error(y_true_real.flatten(), y_pred_real.flatten())))
+    mae = float(mean_absolute_error(y_true_real.flatten(), y_pred_real.flatten()))
+    return y_pred_real, y_true_real, rmse, mae
+
+
+def tune_arima_on_validation(seed: int = 42, machine_id=None, nrows=config.NROWS,
+                              df_raw=None, demand_scale: float = config.DEMAND_SCALE,
+                              order=ARIMA_ORDER) -> dict:
+    """Grid-search ARIMA's decision-engine params on validation only.
+
+    Same grids, same objective (minimize validation cost score), same
+    procedure as the LSTM half of `experiment.tune_on_validation` -- so
+    neither policy is tuned harder than the other. `seed` is accepted only
+    for call-signature symmetry with `tune_on_validation`; ARIMA's rolling
+    forecast has no seed-dependent randomness (see module docstring).
+    Never touches the test split.
+    """
+    ts, machine_id = _load_and_prepare(machine_id, nrows, df_raw)
+    train_data, val_data, _, scaler = _split_three_way(ts, config.FEATURE_COL)
+
+    train_flat = train_data.flatten()
+    val_flat = val_data.flatten()
+
+    y_pred_sc, y_true_sc = _arima_rolling_forecast(
+        train_flat, np.array([], dtype=train_flat.dtype), val_flat,
+        config.LOOKBACK_STEPS, config.HORIZON_STEPS, order,
+    )
+    y_pred_val, y_val_real, val_rmse, val_mae = _forecast_and_score(y_pred_sc, y_true_sc, scaler)
+
+    sim_cfg = SimConfig()
+
+    best_cost = float("inf")
+    best_upw = config.DEC_UNDER_WEIGHT
+    best_sm = config.SAFETY_MARGIN
+    grid_results = []
+
+    for upw in config.LSTM_UPW_GRID:
+        for sm in config.LSTM_SM_GRID:
+            dec_cfg = DecisionConfig(under_prov_weight=upw)
+            targets, demand = _build_lstm_targets(
+                y_pred_val, y_val_real, dec_cfg, sim_cfg, demand_scale, sm
+            )
+            metrics = _run_simulation(demand, targets, sim_cfg)
+            cost = _compute_cost_score(metrics, dec_cfg)
+            grid_results.append((upw, sm, cost))
+            if cost < best_cost:
+                best_cost = cost
+                best_upw, best_sm = upw, sm
+
+    return {
+        "machine_id": machine_id,
+        "arima_order": order,
+        "arima_under_prov_weight": best_upw,
+        "arima_safety_margin": best_sm,
+        "arima_val_cost": round(best_cost, 6),
+        "arima_val_rmse": round(val_rmse, 6),
+        "arima_val_mae": round(val_mae, 6),
+        "arima_grid": grid_results,
+    }
+
+
+def run_arima_experiment(
+    seed: int,
+    under_prov_weight: float = config.DEC_UNDER_WEIGHT,
+    safety_margin: float = config.SAFETY_MARGIN,
+    machine_id=None,
+    nrows=config.NROWS,
+    df_raw=None,
+    demand_scale: float = config.DEMAND_SCALE,
+    order=ARIMA_ORDER,
+) -> dict:
+    """Run ARIMA through the full pipeline, evaluated on the TEST split only.
+
+    Mirrors `experiment.run_single_experiment`'s shape and field names
+    (prefixed `arima_` instead of `lstm_`) so results drop into the same
+    per-machine comparison tables and CSV schema. `under_prov_weight` /
+    `safety_margin` must come from `tune_arima_on_validation` so test is
+    never involved in tuning -- identical discipline to the LSTM path.
+
+    `seed` does not affect ARIMA's fit (see module docstring); it is kept
+    in the signature and output only for schema symmetry with the LSTM
+    multi-seed harness.
+    """
+    ts, machine_id = _load_and_prepare(machine_id, nrows, df_raw)
+    train_data, val_data, test_data, scaler = _split_three_way(ts, config.FEATURE_COL)
+
+    train_flat = train_data.flatten()
+    val_flat = val_data.flatten()
+    test_flat = test_data.flatten()
+
+    t0 = time.time()
+    y_pred_sc, y_true_sc = _arima_rolling_forecast(
+        train_flat, val_flat, test_flat,
+        config.LOOKBACK_STEPS, config.HORIZON_STEPS, order,
+    )
+    wall_clock_secs = time.time() - t0
+
+    y_pred_real, y_test_real, arima_rmse, arima_mae = _forecast_and_score(
+        y_pred_sc, y_true_sc, scaler
+    )
+
+    dec_cfg = DecisionConfig(under_prov_weight=under_prov_weight)
+    sim_cfg = SimConfig()
+
+    arima_targets, demand_series = _build_lstm_targets(
+        y_pred_real, y_test_real, dec_cfg, sim_cfg, demand_scale, safety_margin
+    )
+    arima_metrics = _run_simulation(demand_series, arima_targets, sim_cfg)
+    arima_cost = _compute_cost_score(arima_metrics, dec_cfg)
+
+    n = arima_metrics.total_steps
+    return {
+        "seed": seed,
+        "arima_order": order,
+        "arima_forecast_rmse": round(arima_rmse, 6),
+        "arima_forecast_mae": round(arima_mae, 6),
+        "arima_sla_violation_rate_pct": round(arima_metrics.sla_violations / n * 100, 4),
+        "arima_over_prov_waste_pct": round(arima_metrics.over_prov_steps / n * 100, 4),
+        "arima_cost_score": arima_cost,
+        "arima_wall_clock_secs": round(wall_clock_secs, 1),
+    }

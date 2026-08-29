@@ -87,6 +87,13 @@ _LAZY = {
     "_evaluate_naive":       (".forecasting", "_evaluate_naive"),
     "_inv":                  (".forecasting", "_inv"),
     "_train_lstm":           (".forecasting", "_train_lstm"),
+    # Requires statsmodels (not TensorFlow), but resolved lazily for the same
+    # reason: no import cost for callers who don't need it. See
+    # arima_baseline.py's module docstring.
+    "run_arima_experiment":      (".arima_baseline", "run_arima_experiment"),
+    "tune_arima_on_validation":  (".arima_baseline", "tune_arima_on_validation"),
+    "_arima_rolling_forecast":   (".arima_baseline", "_arima_rolling_forecast"),
+    "ARIMA_ORDER":                (".arima_baseline", "ARIMA_ORDER"),
 }
 
 
@@ -118,4 +125,6 @@ __all__ = [
     "_build_lstm_model", "_evaluate_lstm", "_evaluate_naive", "_inv", "_train_lstm",
     "SimConfig", "SimMetrics", "_compute_cost_score", "_reactive_autoscaler",
     "_run_simulation",
+    "run_arima_experiment", "tune_arima_on_validation", "_arima_rolling_forecast",
+    "ARIMA_ORDER",
 ]
