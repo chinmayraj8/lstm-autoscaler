@@ -26,7 +26,7 @@ import pandas as pd
 _ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 sys.path.insert(0, _ROOT)
 
-from experiments.pipeline import (  # noqa: E402
+from src.autoscaler import (  # noqa: E402
     DATA_PATH,
     DEMAND_SCALE,
     FEATURE_COL,

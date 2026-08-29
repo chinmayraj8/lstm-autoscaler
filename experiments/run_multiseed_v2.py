@@ -19,7 +19,7 @@ import numpy as np
 import pandas as pd
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-from experiments.pipeline import (
+from src.autoscaler import (
     DEC_UNDER_WEIGHT, REACTIVE_DOWN_THRESHOLD, REACTIVE_UP_THRESHOLD,
     SAFETY_MARGIN, run_single_experiment, tune_on_validation,
 )

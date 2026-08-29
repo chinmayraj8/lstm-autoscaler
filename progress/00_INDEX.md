@@ -4,6 +4,7 @@ See `README.md` in this folder for the convention these entries follow.
 
 | Date | Step | Summary | Key result |
 |---|---|---|---|
+| 2026-08-29 | [Step 9: src/ package extraction + pytest suite](./2026-08-29_step9-src-refactor.md) | Split `experiments/pipeline.py` (515 lines, no tests) into a proper `src/autoscaler/` package (config/data/decision/simulation/calibration/forecasting/experiment); `pipeline.py` is now a backward-compatible shim; added 25 pytest tests for the non-TensorFlow logic | **No numeric behavior changed** — 25/25 tests pass for real; every touched file's import graph verified clean. Full regression against the real dataset/TensorFlow still needs to be run in the real venv (see the step file's "Still open"). |
 | 2026-08-27 | [Step 8: Expanded multi-machine validation](./2026-08-27_step8-expanded-multimachine.md) | Same K-means (k=4) + stress-test selection as Step 4, but 3-4 machines per cluster (17 total, 13 feasible) instead of 1 | **LSTM cost advantage generalizes**: 10/13 feasible machines (77%) show a confirmed cost advantage, up from 2/4 in Step 5 — not two lucky machines. But the "tied SLA" framing does NOT generalize: 0/13 machines show tied SLA; the real pattern is a trade-off (LSTM wins cost, Reactive wins SLA) on 9/10, with one exception (m_2085) where LSTM wins both. Entire cluster 1 (4/4 sampled) is infeasible, not just m_2101. Burstiness-cost correlation collapses (r=-0.639 → -0.218); burstiness-SLA correlation holds (r=-0.876). |
 | 2026-08-27 | [Step 6: ARIMA baseline + sweep](./2026-08-27_step6-arima-baseline-and-sweep.md) | ARIMA(2,0,1) baseline; 3-way RMSE/MAE comparison; horizon sweep 5–60 min; lookback sweep 15–120 min | **ARIMA matches LSTM on RMSE** (0.5774 vs 0.5788±0.0046 — within 1σ). Both beat naive by 23%. LSTM sweet spot: 15-min horizon, 30-min lookback; plateau beyond. |
 | 2026-08-27 | [Step 5: Per-machine demand-scale calibration](./2026-08-27_step5-demand-scale-calibration.md) | Replace global DEMAND_SCALE=20 with calibrate_demand_scale(mean_cpu, target=115%); re-run Step 4's 5 machines; skip infeasible (p99 > 800%) | **Step 4 LSTM SLA advantage on m_2134 retracted** — was ceiling-collision artifact. **First confirmed LSTM cost advantage** on m_2189 (+0.1572) and m_2065 (+0.0561). Burstiness hypothesis now disconfirmed for SLA (r=−0.91). |
@@ -12,7 +13,7 @@ See `README.md` in this folder for the convention these entries follow.
 | 2026-08-26 | [Step 2: Multi-seed harness](./2026-08-26_step2-multiseed-harness.md) | Extracted pipeline into `experiments/pipeline.py`; ran 5 seeds (42–46); wrote results to `experiments/results.csv` | LSTM cost advantage is firmly established (0.0737 ± 0.0210 vs 0.1347, gap > combined ±1σ). SLA advantage has correct direction (0.3532% vs 0.4415%) but is within one combined σ — not yet confirmed. (Result invalidated by Step 3 — was tuning-asymmetry artifact.) |
 | 2026-08-25 | [Step 1: Leakage fix + naive baseline](./2026-08-25_step1-leakage-fix-and-naive-baseline.md) | Fixed train/test scaler leakage; added naive persistence baseline; retrained model from scratch; re-executed notebook for real | LSTM beats naive baseline by 23% lower RMSE (new, real evidence). LSTM-vs-Reactive SLA result flipped between two identically-seeded runs (0.22% vs 0.44% in one, 0.44% vs 0.44% tie in another) — proves the single-run comparison isn't trustworthy yet. |
 
-## What's confirmed so far (updated after Step 8)
+## What's confirmed so far (updated after Step 9)
 - Scaler leakage bug: **fixed** (§7.1 of the audit).
 - Naive persistence baseline: **added** (§7.5).
 - Model retrains from scratch instead of silently reloading a stale cached model.
@@ -31,8 +32,10 @@ See `README.md` in this folder for the convention these entries follow.
 - Burstiness–SLA correlation: **r=−0.876 (n=13, Step 8)**, consistent with Step 5's r=−0.911 (n=4) — strongly negative; hypothesis fails, holds up with more data.
 - Burstiness–cost correlation: **collapses from r=−0.639 (n=4, Step 5) to r=−0.218 (n=13, Step 8)** — Step 5's cost correlation was largely a small-sample artifact.
 - **Entire cluster 1 is infeasible** (Step 8), not just m_2101 (Step 5): all 4 sampled members (m_2101, m_2315, m_2281, m_2049) have p99 demand 830-965% > 800% fleet cap. Structural, not machine-specific.
+- **Core pipeline is now a tested package** (Step 9): `src/autoscaler/`, 25 passing pytest tests on the decision engine, simulator, and calibration math. `experiments/pipeline.py` kept as a compatibility shim.
 
 ## What's still open (in rough order)
+- **Step 9's refactor needs a real end-to-end regression run** — confirm `run_multiseed.py` (or any `run_*.py`) still reproduces the existing results CSVs bit-for-bit, in the real venv with real TensorFlow and the real dataset (the refactor itself was built and verified without either).
 - ARIMA vs LSTM comparison run on m_1933 only. Whether ARIMA remains competitive on bursty machines (m_2189, m_2134, or the other 12 Step 8 machines) is unknown.
 - ARIMA not yet used in the autoscaler simulation (no cost-score comparison, only RMSE/MAE).
 - **m_2085 (LSTM wins both metrics) is unexplained** — what differs about its demand shape vs m_2087/m_2241 in the same cluster where Reactive wins both.
@@ -40,4 +43,4 @@ See `README.md` in this folder for the convention these entries follow.
 - Cluster 1 (m_2101 and neighbors) infeasible at any reasonable scale — needs a higher `max_servers` ceiling or a burst-absorbing capacity tier to evaluate at all.
 - Only 13/733 qualifying machines evaluated (1.8%) — K-means clusters are coarse over 3 features; within-cluster diversity (cluster 2 alone has 3 distinct outcomes) suggests even 13 may undersample the real variance.
 - Burstiness hypothesis fully disconfirmed for SLA; fails for cost too now (correlation collapsed with more data).
-- Phase 2B onward (src/ extraction, API, Kubernetes, dashboard): not started.
+- Containerization (Docker) and a real Kubernetes/KEDA deployment: not started. (The FastAPI service and the Streamlit dashboard are both already done, ahead of this index — see `src/api/` and `src/dashboard/`.)

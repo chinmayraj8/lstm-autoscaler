@@ -36,7 +36,7 @@ _ROOT = Path(__file__).resolve().parents[2]
 if str(_ROOT) not in sys.path:
     sys.path.insert(0, str(_ROOT))
 
-from experiments.pipeline import (  # noqa: E402
+from src.autoscaler import (  # noqa: E402
     DEMAND_SCALE,
     DEC_OVER_WEIGHT,
     DEC_UNDER_WEIGHT,

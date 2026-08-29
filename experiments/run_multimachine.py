@@ -26,7 +26,7 @@ from sklearn.cluster import KMeans
 from sklearn.preprocessing import StandardScaler
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-from experiments.pipeline import (
+from src.autoscaler import (
     DATA_PATH,
     _prepare_timeseries,
     run_single_experiment,

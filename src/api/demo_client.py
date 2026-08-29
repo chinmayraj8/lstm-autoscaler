@@ -37,7 +37,7 @@ if str(_ROOT) not in sys.path:
 import warnings
 warnings.filterwarnings("ignore")
 
-from experiments.pipeline import (  # noqa: E402
+from src.autoscaler import (  # noqa: E402
     DEMAND_SCALE,
     FEATURE_COL,
     HORIZON_STEPS,

@@ -29,7 +29,7 @@ import pandas as pd
 from sklearn.metrics import mean_absolute_error, mean_squared_error
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-from experiments.pipeline import (
+from src.autoscaler import (
     DATA_PATH,
     FEATURE_COL,
     HORIZON_STEPS,

@@ -1,0 +1,5 @@
+# Dev-only dependencies for running the test suite (tests/).
+# Install alongside the main setup from README.md:
+#   venv/bin/pip install -r requirements-dev.txt
+#   venv/bin/python -m pytest tests/ -v
+pytest>=8.0
