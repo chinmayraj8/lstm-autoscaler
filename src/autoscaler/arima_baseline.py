@@ -122,7 +122,7 @@ def _forecast_and_score(y_pred_scaled, y_true_scaled, scaler):
 
 def tune_arima_on_validation(seed: int = 42, machine_id=None, nrows=config.NROWS,
                               df_raw=None, demand_scale: float = config.DEMAND_SCALE,
-                              order=ARIMA_ORDER) -> dict:
+                              order=ARIMA_ORDER, target_builder=_build_lstm_targets) -> dict:
     """Grid-search ARIMA's decision-engine params on validation only.
 
     Same grids, same objective (minimize validation cost score), same
@@ -131,6 +131,12 @@ def tune_arima_on_validation(seed: int = 42, machine_id=None, nrows=config.NROWS
     for call-signature symmetry with `tune_on_validation`; ARIMA's rolling
     forecast has no seed-dependent randomness (see module docstring).
     Never touches the test split.
+
+    `target_builder` selects the decision engine (default: the original
+    greedy `_build_lstm_targets`; pass `_build_multistep_targets` from
+    decision.py, Step 12, to tune the multi-step-aware engine on ARIMA's
+    forecasts instead) -- same option `tune_on_validation` exposes for the
+    LSTM, so both forecasters can be compared under either engine fairly.
     """
     ts, machine_id = _load_and_prepare(machine_id, nrows, df_raw)
     train_data, val_data, _, scaler = _split_three_way(ts, config.FEATURE_COL)
@@ -154,7 +160,7 @@ def tune_arima_on_validation(seed: int = 42, machine_id=None, nrows=config.NROWS
     for upw in config.LSTM_UPW_GRID:
         for sm in config.LSTM_SM_GRID:
             dec_cfg = DecisionConfig(under_prov_weight=upw)
-            targets, demand = _build_lstm_targets(
+            targets, demand = target_builder(
                 y_pred_val, y_val_real, dec_cfg, sim_cfg, demand_scale, sm
             )
             metrics = _run_simulation(demand, targets, sim_cfg)
@@ -185,6 +191,7 @@ def run_arima_experiment(
     df_raw=None,
     demand_scale: float = config.DEMAND_SCALE,
     order=ARIMA_ORDER,
+    target_builder=_build_lstm_targets,
 ) -> dict:
     """Run ARIMA through the full pipeline, evaluated on the TEST split only.
 
@@ -193,6 +200,7 @@ def run_arima_experiment(
     per-machine comparison tables and CSV schema. `under_prov_weight` /
     `safety_margin` must come from `tune_arima_on_validation` so test is
     never involved in tuning -- identical discipline to the LSTM path.
+    `target_builder` must match whatever was used during tuning.
 
     `seed` does not affect ARIMA's fit (see module docstring); it is kept
     in the signature and output only for schema symmetry with the LSTM
@@ -219,7 +227,7 @@ def run_arima_experiment(
     dec_cfg = DecisionConfig(under_prov_weight=under_prov_weight)
     sim_cfg = SimConfig()
 
-    arima_targets, demand_series = _build_lstm_targets(
+    arima_targets, demand_series = target_builder(
         y_pred_real, y_test_real, dec_cfg, sim_cfg, demand_scale, safety_margin
     )
     arima_metrics = _run_simulation(demand_series, arima_targets, sim_cfg)

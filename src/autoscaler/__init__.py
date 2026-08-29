@@ -69,7 +69,15 @@ from .data import (
     _prepare_timeseries,
     _split_three_way,
 )
-from .decision import DecisionConfig, _build_lstm_targets, _compute_penalty, _decide_scaling
+from .decision import (
+    DecisionConfig,
+    _build_lstm_targets,
+    _build_multistep_targets,
+    _compute_penalty,
+    _compute_penalty_multistep,
+    _decide_scaling,
+    _decide_scaling_multistep,
+)
 from .simulation import (
     SimConfig,
     SimMetrics,
@@ -121,6 +129,7 @@ __all__ = [
     "_load_and_prepare", "_make_sequences", "_pick_best_machine",
     "_prepare_timeseries", "_split_three_way",
     "DecisionConfig", "_build_lstm_targets", "_compute_penalty", "_decide_scaling",
+    "_build_multistep_targets", "_compute_penalty_multistep", "_decide_scaling_multistep",
     "run_single_experiment", "tune_on_validation",
     "_build_lstm_model", "_evaluate_lstm", "_evaluate_naive", "_inv", "_train_lstm",
     "SimConfig", "SimMetrics", "_compute_cost_score", "_reactive_autoscaler",

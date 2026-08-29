@@ -24,8 +24,15 @@ from .simulation import SimConfig, _compute_cost_score, _reactive_autoscaler, _r
 
 
 def tune_on_validation(seed: int = 42, machine_id=None, nrows=config.NROWS,
-                       df_raw=None, demand_scale: float = config.DEMAND_SCALE) -> dict:
+                       df_raw=None, demand_scale: float = config.DEMAND_SCALE,
+                       target_builder=_build_lstm_targets) -> dict:
     """Grid-search both policies on the validation split only.
+
+    `target_builder` selects the decision engine the LSTM's grid search is
+    scored against -- defaults to the original greedy `_build_lstm_targets`
+    (max-of-horizon). Pass `_build_multistep_targets` (decision.py, Step 12)
+    to tune the multi-step-aware engine instead; same signature, same
+    (targets, demand) return shape, so nothing else here needs to change.
 
     Returns a dict with the best params for Reactive and for the LSTM
     decision engine, plus their validation cost scores and which grid
@@ -82,7 +89,7 @@ def tune_on_validation(seed: int = 42, machine_id=None, nrows=config.NROWS,
     for upw in config.LSTM_UPW_GRID:
         for sm in config.LSTM_SM_GRID:
             dec_cfg = DecisionConfig(under_prov_weight=upw)
-            targets, _ = _build_lstm_targets(
+            targets, _ = target_builder(
                 y_pred_val, y_val_real, dec_cfg, sim_cfg, demand_scale, sm
             )
             metrics = _run_simulation(val_demand, targets, sim_cfg)
@@ -115,11 +122,15 @@ def run_single_experiment(
     nrows=config.NROWS,
     df_raw=None,
     demand_scale: float = config.DEMAND_SCALE,
+    target_builder=_build_lstm_targets,
 ) -> dict:
     """Run the full pipeline for one seed, evaluate on the TEST split only.
 
     All policy parameters must be provided from outside (typically from
     tune_on_validation) so the test split is never involved in tuning.
+    `target_builder` must match whatever was used to produce
+    `under_prov_weight`/`safety_margin` in tuning -- see tune_on_validation's
+    docstring.
     """
     np.random.seed(seed)
     tf.random.set_seed(seed)
@@ -146,7 +157,7 @@ def run_single_experiment(
     dec_cfg = DecisionConfig(under_prov_weight=under_prov_weight)
     sim_cfg = SimConfig()
 
-    lstm_targets, demand_series = _build_lstm_targets(
+    lstm_targets, demand_series = target_builder(
         y_pred_real, y_test_real, dec_cfg, sim_cfg, demand_scale, safety_margin
     )
     lstm_metrics = _run_simulation(demand_series, lstm_targets, sim_cfg)
