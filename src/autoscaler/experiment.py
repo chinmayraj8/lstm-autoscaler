@@ -17,16 +17,38 @@ import tensorflow as tf
 
 from . import config
 from .calibration import calibrate_demand_scale  # noqa: F401  (re-exported for convenience)
-from .data import _load_and_prepare, _make_sequences, _split_three_way
+from .data import (
+    _load_and_prepare,
+    _make_multivariate_sequences,
+    _make_sequences,
+    _prepare_multivariate,
+    _split_three_way,
+    _split_three_way_multivariate,
+)
 from .decision import DecisionConfig, _build_lstm_targets
 from .forecasting import _build_lstm_model, _evaluate_lstm, _evaluate_naive, _train_lstm
 from .simulation import SimConfig, _compute_cost_score, _reactive_autoscaler, _run_simulation
 
 
+def _prepare_lstm_split(ts, multivariate: bool):
+    """Shared by tune_on_validation/run_single_experiment (Step 14): returns
+    `(train, val, test, scaler, n_features, make_sequences)` -- the
+    univariate path (unchanged) or the multivariate path
+    (data._prepare_multivariate + _split_three_way_multivariate), so both
+    callers branch on `multivariate` in exactly one place."""
+    if multivariate:
+        feat_df = _prepare_multivariate(ts, config.FEATURE_COL)
+        train, val, test, scaler = _split_three_way_multivariate(feat_df, config.FEATURE_COL)
+        return train, val, test, scaler, feat_df.shape[1], _make_multivariate_sequences
+    train, val, test, scaler = _split_three_way(ts, config.FEATURE_COL)
+    return train, val, test, scaler, 1, _make_sequences
+
+
 def tune_on_validation(seed: int = 42, machine_id=None, nrows=config.NROWS,
                        df_raw=None, demand_scale: float = config.DEMAND_SCALE,
                        target_builder=_build_lstm_targets,
-                       horizon_weights_grid=None) -> dict:
+                       horizon_weights_grid=None,
+                       multivariate: bool = False) -> dict:
     """Grid-search both policies on the validation split only.
 
     `target_builder` selects the decision engine the LSTM's grid search is
@@ -48,6 +70,13 @@ def tune_on_validation(seed: int = 42, machine_id=None, nrows=config.NROWS,
     horizon_weights, cost)` instead -- callers that only care about the
     default single-candidate behavior are unaffected either way.
 
+    `multivariate` (Step 14): False (default, unchanged) uses the original
+    univariate CPU%-only input. True adds time-of-day/day-of-week
+    (cyclically encoded) and a short rolling mean/std as extra input
+    channels (data._prepare_multivariate) -- everything else (architecture,
+    grids, decision engine) stays identical, so this isolates "does more
+    input signal help" from any other confound.
+
     Returns a dict with the best params for Reactive and for the LSTM
     decision engine, plus their validation cost scores and which grid
     values were tried.  Never touches the test split.
@@ -56,13 +85,13 @@ def tune_on_validation(seed: int = 42, machine_id=None, nrows=config.NROWS,
     tf.random.set_seed(seed)
 
     ts, machine_id = _load_and_prepare(machine_id, nrows, df_raw)
-    train_data, val_data, _, scaler = _split_three_way(ts, config.FEATURE_COL)
+    train_data, val_data, _, scaler, n_features, make_sequences = _prepare_lstm_split(ts, multivariate)
 
-    X_train, y_train = _make_sequences(train_data, config.LOOKBACK_STEPS, config.HORIZON_STEPS)
-    X_val,   y_val   = _make_sequences(val_data,   config.LOOKBACK_STEPS, config.HORIZON_STEPS)
+    X_train, y_train = make_sequences(train_data, config.LOOKBACK_STEPS, config.HORIZON_STEPS)
+    X_val,   y_val   = make_sequences(val_data,   config.LOOKBACK_STEPS, config.HORIZON_STEPS)
 
     # Train LSTM on train split (Keras val_split is last 10 % of TRAIN for early-stopping)
-    lstm_model = _build_lstm_model(config.LOOKBACK_STEPS, config.HORIZON_STEPS)
+    lstm_model = _build_lstm_model(config.LOOKBACK_STEPS, config.HORIZON_STEPS, n_features)
     exp_dir    = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
     model_path = os.path.join(exp_dir, "experiments", f"_tmp_tune_seed_{seed}.keras")
     _train_lstm(lstm_model, X_train, y_train, model_path)
@@ -145,6 +174,7 @@ def run_single_experiment(
     demand_scale: float = config.DEMAND_SCALE,
     target_builder=_build_lstm_targets,
     horizon_weights=None,
+    multivariate: bool = False,
 ) -> dict:
     """Run the full pipeline for one seed, evaluate on the TEST split only.
 
@@ -154,18 +184,20 @@ def run_single_experiment(
     `under_prov_weight`/`safety_margin` in tuning -- see tune_on_validation's
     docstring. `horizon_weights` (Step 13): the single winning candidate from
     `tune_on_validation`'s `horizon_weights_grid` (or `None`, unchanged
-    behavior) -- only meaningful for `_build_multistep_targets`.
+    behavior) -- only meaningful for `_build_multistep_targets`. `multivariate`
+    (Step 14): must match whatever `tune_on_validation` used -- see its
+    docstring.
     """
     np.random.seed(seed)
     tf.random.set_seed(seed)
 
     ts, machine_id = _load_and_prepare(machine_id, nrows, df_raw)
-    train_data, _, test_data, scaler = _split_three_way(ts, config.FEATURE_COL)
+    train_data, _, test_data, scaler, n_features, make_sequences = _prepare_lstm_split(ts, multivariate)
 
-    X_train, y_train = _make_sequences(train_data, config.LOOKBACK_STEPS, config.HORIZON_STEPS)
-    X_test,  y_test  = _make_sequences(test_data,  config.LOOKBACK_STEPS, config.HORIZON_STEPS)
+    X_train, y_train = make_sequences(train_data, config.LOOKBACK_STEPS, config.HORIZON_STEPS)
+    X_test,  y_test  = make_sequences(test_data,  config.LOOKBACK_STEPS, config.HORIZON_STEPS)
 
-    lstm_model = _build_lstm_model(config.LOOKBACK_STEPS, config.HORIZON_STEPS)
+    lstm_model = _build_lstm_model(config.LOOKBACK_STEPS, config.HORIZON_STEPS, n_features)
     exp_dir    = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
     model_path = os.path.join(exp_dir, "experiments", f"_tmp_model_seed_{seed}.keras")
     history, wall_clock_secs = _train_lstm(lstm_model, X_train, y_train, model_path)

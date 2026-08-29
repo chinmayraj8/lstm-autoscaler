@@ -64,10 +64,13 @@ from .config import (
 from .calibration import calibrate_demand_scale, check_feasibility
 from .data import (
     _load_and_prepare,
+    _make_multivariate_sequences,
     _make_sequences,
     _pick_best_machine,
+    _prepare_multivariate,
     _prepare_timeseries,
     _split_three_way,
+    _split_three_way_multivariate,
 )
 from .decision import (
     DecisionConfig,
@@ -102,6 +105,7 @@ _LAZY = {
     "tune_arima_on_validation":  (".arima_baseline", "tune_arima_on_validation"),
     "_arima_rolling_forecast":   (".arima_baseline", "_arima_rolling_forecast"),
     "ARIMA_ORDER":                (".arima_baseline", "ARIMA_ORDER"),
+    "select_arima_order":        (".arima_baseline", "select_arima_order"),
 }
 
 
@@ -128,6 +132,7 @@ __all__ = [
     "calibrate_demand_scale", "check_feasibility",
     "_load_and_prepare", "_make_sequences", "_pick_best_machine",
     "_prepare_timeseries", "_split_three_way",
+    "_make_multivariate_sequences", "_prepare_multivariate", "_split_three_way_multivariate",
     "DecisionConfig", "_build_lstm_targets", "_compute_penalty", "_decide_scaling",
     "_build_multistep_targets", "_compute_penalty_multistep", "_decide_scaling_multistep",
     "run_single_experiment", "tune_on_validation",
@@ -135,5 +140,5 @@ __all__ = [
     "SimConfig", "SimMetrics", "_compute_cost_score", "_reactive_autoscaler",
     "_run_simulation",
     "run_arima_experiment", "tune_arima_on_validation", "_arima_rolling_forecast",
-    "ARIMA_ORDER",
+    "ARIMA_ORDER", "select_arima_order",
 ]

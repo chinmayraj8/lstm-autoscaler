@@ -24,9 +24,15 @@ from tensorflow.keras.optimizers import Adam
 from . import config
 
 
-def _build_lstm_model(lookback: int, horizon: int) -> tf.keras.Model:
+def _build_lstm_model(lookback: int, horizon: int, n_features: int = 1) -> tf.keras.Model:
+    """`n_features` (Step 14): 1 for the original univariate CPU% input,
+    >1 for the multivariate input (data._prepare_multivariate) that adds
+    time-of-day/day-of-week + rolling mean/std channels. Everything else
+    about the architecture -- units, layers, dropout, optimizer -- is
+    unchanged, so this is a clean test of additional input signal, not a
+    confound of its own."""
     model = Sequential([
-        LSTM(config.LSTM_UNITS, return_sequences=True, input_shape=(lookback, 1)),
+        LSTM(config.LSTM_UNITS, return_sequences=True, input_shape=(lookback, n_features)),
         Dropout(config.DROPOUT_RATE),
         LSTM(config.LSTM_UNITS, return_sequences=False),
         Dropout(config.DROPOUT_RATE),

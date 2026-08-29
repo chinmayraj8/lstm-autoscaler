@@ -52,7 +52,52 @@ from .data import _load_and_prepare, _split_three_way
 from .decision import DecisionConfig, _build_lstm_targets
 from .simulation import SimConfig, _compute_cost_score, _reactive_autoscaler, _run_simulation
 
-ARIMA_ORDER = (2, 0, 1)   # same order selected a priori in Step 6
+ARIMA_ORDER = (2, 0, 1)   # same order selected a priori in Step 6 -- frozen
+                          # unchanged through Steps 8-13; Step 14 adds
+                          # per-machine order re-selection alongside it
+                          # (select_arima_order, below), not a replacement.
+
+
+def select_arima_order(train_flat, p_range=range(0, 5), d_range=(0, 1), q_range=range(0, 5),
+                       criterion: str = "aic"):
+    """Grid-search ARIMA(p,d,q) order on the TRAIN split only via AIC (default)
+    or BIC -- standard Box-Jenkins order selection, no leakage (never touches
+    val or test). Each candidate is a single `ARIMA(order).fit()` MLE call on
+    `train_flat` (not the rolling forecast -- that happens later, once an
+    order is chosen, inside `_arima_rolling_forecast`). Orders that fail to
+    converge or hit non-stationarity/non-invertibility errors are skipped,
+    not scored -- this is expected for some (p, d, q) combinations and not a
+    bug.
+
+    Returns `(best_order, results)` where `results` is a list of
+    `(order, aic, bic)` for every order that converged, sorted by `criterion`
+    ascending (best first). Falls back to `ARIMA_ORDER` if nothing converged
+    (should not happen for reasonable ranges on real demand data).
+    """
+    from statsmodels.tsa.arima.model import ARIMA
+
+    results = []
+    for p in p_range:
+        for d in d_range:
+            for q in q_range:
+                if p == 0 and q == 0:
+                    continue
+                order = (p, d, q)
+                try:
+                    with warnings.catch_warnings():
+                        warnings.simplefilter("ignore")
+                        fit = ARIMA(train_flat, order=order).fit()
+                    if np.isfinite(fit.aic) and np.isfinite(fit.bic):
+                        results.append((order, float(fit.aic), float(fit.bic)))
+                except Exception:
+                    continue
+
+    if not results:
+        return ARIMA_ORDER, results
+
+    key_idx = 1 if criterion == "aic" else 2
+    results.sort(key=lambda r: r[key_idx])
+    return results[0][0], results
 
 
 def _inv_flat(arr: np.ndarray, scaler: MinMaxScaler) -> np.ndarray:
