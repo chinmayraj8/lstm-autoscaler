@@ -113,6 +113,67 @@ def _inv_flat(arr: np.ndarray, scaler: MinMaxScaler) -> np.ndarray:
     return out
 
 
+def _inv_residual(residual_scaled: np.ndarray, scaler: MinMaxScaler) -> np.ndarray:
+    """Inverse-transform a SCALED RESIDUAL (a difference of two scaled
+    values) back to real units -- Step 16 (residual hybrid).
+
+    NOT the same operation as `_inv_flat`/`scaler.inverse_transform` on a
+    raw value: for an affine MinMaxScaler (`real = scaled * range + min`),
+    `real_a - real_b == (scaled_a - scaled_b) * range` -- the additive
+    offset (`min`) cancels out of any difference, so a residual must only
+    be multiplied by the scaler's range, never shifted by its offset.
+    Applying `inverse_transform` directly to a residual would incorrectly
+    add that offset back in.
+    """
+    rng = float(scaler.data_max_[0] - scaler.data_min_[0])
+    return residual_scaled * rng
+
+
+def _arima_train_walkforward(fit_full, train_flat, lookback, horizon):
+    """Honest walk-forward multi-step rolling forecast THROUGH train itself
+    -- Step 16 (residual hybrid), used to generate training labels for the
+    residual-predicting LSTM.
+
+    Reuses `fit_full`'s ALREADY-ESTIMATED parameters (from the full train
+    set via `.fit()` -- identical to the deployed model everywhere else in
+    this project) but replays the observation history from scratch via
+    `.apply()` (re-uses fixed parameters, does not re-estimate) followed by
+    the same `.append(refit=False)` walk-forward loop `_arima_rolling_forecast`
+    already uses for val/test, so each forecast at step `i` only reflects
+    points revealed so far (indices `0..lookback+i-1`), never later points
+    in train. This avoids "the model already saw this exact point while
+    being fit" as a leakage concern for the residual labels specifically,
+    while keeping parameters identical to the deployed ARIMA (no
+    fit-mismatch between the label-generating and the actually-deployed
+    model). Standard hybrid-ARIMA-ANN practice (e.g. Zhang 2003) uses
+    plain in-sample fitted values for this; this is a stricter walk-forward
+    variant of the same idea, made possible by `_arima_rolling_forecast`'s
+    existing `.append(refit=False)` mechanism already being available.
+
+    Returns `(y_pred_scaled, y_true_scaled)`, shape `(n_sequences, horizon)`,
+    aligned with `_make_sequences(train_data, lookback, horizon)` exactly
+    like `_arima_rolling_forecast`'s val/test outputs are.
+    """
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        fit_walk = fit_full.apply(train_flat[:lookback], refit=False)
+
+    n_sequences = len(train_flat) - lookback - horizon + 1
+    if n_sequences <= 0:
+        raise ValueError(f"Not enough train data for lookback={lookback} horizon={horizon}")
+
+    y_pred_sc, y_true_sc = [], []
+    for i in range(n_sequences):
+        fc = fit_walk.forecast(steps=horizon)
+        y_pred_sc.append(np.clip(fc, 0.0, 1.0))
+        y_true_sc.append(train_flat[i + lookback: i + lookback + horizon])
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            fit_walk = fit_walk.append([train_flat[i + lookback]], refit=False)
+
+    return np.array(y_pred_sc), np.array(y_true_sc)
+
+
 def _arima_rolling_forecast(train_flat, context_flat, target_flat,
                             lookback, horizon, order=ARIMA_ORDER):
     """Roll ARIMA forecasts across `target_flat`, aligned with `_make_sequences`.

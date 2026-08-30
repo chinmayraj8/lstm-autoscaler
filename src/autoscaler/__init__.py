@@ -106,6 +106,9 @@ _LAZY = {
     "_arima_rolling_forecast":   (".arima_baseline", "_arima_rolling_forecast"),
     "ARIMA_ORDER":                (".arima_baseline", "ARIMA_ORDER"),
     "select_arima_order":        (".arima_baseline", "select_arima_order"),
+    "_arima_train_walkforward":  (".arima_baseline", "_arima_train_walkforward"),
+    "_inv_residual":             (".arima_baseline", "_inv_residual"),
+    "_inv_flat":                 (".arima_baseline", "_inv_flat"),
 }
 
 
@@ -141,4 +144,5 @@ __all__ = [
     "_run_simulation",
     "run_arima_experiment", "tune_arima_on_validation", "_arima_rolling_forecast",
     "ARIMA_ORDER", "select_arima_order",
+    "_arima_train_walkforward", "_inv_residual", "_inv_flat",
 ]
