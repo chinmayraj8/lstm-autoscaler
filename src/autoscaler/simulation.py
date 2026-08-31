@@ -75,6 +75,33 @@ def _compute_cost_score(metrics: SimMetrics, cfg) -> float:
     return round(over_cost + under_cost, 6)
 
 
+def verdict(cost_a: float, cost_b: float, std_a: float, std_b: float) -> str:
+    """Is `a` confirmed cheaper than `b`? The combined-+/-1-sigma rule this
+    project has used since Step 11 (run_multimachine_v2._verdict,
+    generalized in run_arima_full13._verdict) to classify a cost comparison
+    -- promoted here (Step 18) into the package proper so shadow.py (and
+    any future caller) reuses the exact same statistical bar instead of a
+    fresh reimplementation. `run_arima_full13.py`'s own `_verdict` is left
+    as-is (not worth touching already-validated experiment scripts), but
+    is byte-for-byte the same formula.
+
+    `std_a`/`std_b` are 0.0 for a deterministic quantity (e.g. ARIMA, or a
+    single shadow-window's raw cost with no repeats yet) -- callers pass
+    0.0 explicitly rather than None to keep the comparison's basis
+    unambiguous in logs/tests.
+    """
+    gap = cost_b - cost_a   # positive => a is cheaper
+    combined = (std_a or 0.0) + (std_b or 0.0)
+    if gap > combined:
+        return "confirmed cheaper"
+    elif gap > 0:
+        return "directional (within ±1σ)"
+    elif abs(gap) <= combined:
+        return "tied (within ±1σ)"
+    else:
+        return "confirmed more expensive"
+
+
 def _reactive_autoscaler(demand_series, sim_cfg,
                           scale_up_threshold:   float = config.REACTIVE_UP_THRESHOLD,
                           scale_down_threshold: float = config.REACTIVE_DOWN_THRESHOLD):

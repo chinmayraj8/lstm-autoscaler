@@ -3,17 +3,46 @@ FastAPI autoscaler inference service.
 
 Endpoints
 ---------
-GET  /health     — liveness + model-info check
-POST /forecast   — given the last 30 minutes of CPU utilisation (6 readings
-                   at 5-min intervals), returns the 15-minute-ahead forecast
-                   and a recommended server scaling action.
+GET  /health              — liveness + model-info check
+POST /forecast             — given the last 30 minutes of CPU utilisation (6
+                             readings at 5-min intervals), returns the
+                             15-minute-ahead forecast and a recommended
+                             server scaling action.
+POST /shadow/{machine_id}/window — Step 18: submit one already-observed
+                             shadow window's real demand plus BOTH ARIMA's
+                             and the residual hybrid's forecasts for it;
+                             scores both through the existing decision
+                             engine/simulator (src/autoscaler/shadow.py,
+                             which reuses decision.py/simulation.py
+                             unmodified), banks the result, and re-runs the
+                             assignment decision. Neither forecaster
+                             controls the real fleet through this endpoint
+                             — this is pure shadow measurement. This
+                             endpoint does NOT run ARIMA or the hybrid LSTM
+                             itself; the caller (an offline/scheduled job
+                             with access to the real fleet's telemetry and
+                             both forecasting pipelines) submits each
+                             window's forecasts already computed. See
+                             shadow.py's module docstring for exactly what
+                             the gating logic is and is not (a repeat-window
+                             statistical gate, not a bandit).
+GET  /shadow/{machine_id}  — current shadow-evaluation state for one
+                             machine: which forecaster it's assigned to,
+                             how many shadow windows are banked, cumulative
+                             cost/SLA, and the full assignment-change
+                             history.
 
 Run from the project root:
     uvicorn src.api.main:app --reload
 
 The service loads lstm_model.keras from the project root and fits the
 MinMaxScaler used for normalisation from m_1933's training split at startup,
-matching the split used throughout the experiment pipeline.
+matching the split used throughout the experiment pipeline. The /shadow
+endpoints are independent of that model/scaler state — they only need
+already-computed forecast arrays and operate purely on
+src/autoscaler/shadow.py's in-memory per-machine state (module-level dict,
+same pattern as `_state` below; not persisted across restarts — a real
+deployment would back this with a database, which is out of scope here).
 """
 
 from __future__ import annotations
@@ -23,7 +52,7 @@ import warnings
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import List
+from typing import Dict, List, Optional
 
 import numpy as np
 from fastapi import FastAPI, HTTPException
@@ -49,12 +78,19 @@ from src.autoscaler import (  # noqa: E402
     _decide_scaling,
     _load_and_prepare,
     _split_three_way,
+    shadow,
 )
 
 # ── Module-level state (populated at startup, read during requests) ───────────
 _state: dict = {}
 
 _MODEL_PATH = _ROOT / "lstm_model.keras"
+
+# Step 18: per-machine shadow-evaluation state (src/autoscaler/shadow.py).
+# In-memory only, same pattern as `_state` above -- does not survive a
+# restart. A real deployment would back this with a database; that's out
+# of scope for this step, which is about the harness logic itself.
+_shadow_states: Dict[str, shadow.MachineShadowState] = {}
 
 
 @asynccontextmanager
@@ -244,4 +280,128 @@ def forecast(req: ForecastRequest) -> ForecastResponse:
         recommended_servers=recommended_servers,
         action=action,
         utc_timestamp=datetime.now(timezone.utc).isoformat(),
+    )
+
+
+# ── Shadow-mode evaluation (Step 18) ────────────────────────────────────────
+# See src/autoscaler/shadow.py's module docstring for the full design and
+# for what this deliberately is NOT (a repeat-window statistical gate, not
+# a continuously-exploring bandit). These endpoints are thin HTTP wiring
+# around that module -- no scoring/gating logic lives here.
+
+class ShadowWindowRequest(BaseModel):
+    window_start: datetime
+    window_end: datetime
+    demand_scale: float = Field(..., gt=0)
+    y_actual: List[List[float]] = Field(
+        ..., description="Actual demand for this window, shape (n_sequences, horizon_steps), real CPU% units."
+    )
+    arima_forecast: List[List[float]] = Field(
+        ..., description="ARIMA's forecast for this window, same shape as y_actual."
+    )
+    arima_under_prov_weight: float = Field(DEC_UNDER_WEIGHT, gt=0)
+    arima_safety_margin: float = Field(SAFETY_MARGIN, ge=0.0, le=1.0)
+    hybrid_forecast: List[List[float]] = Field(
+        ..., description="Residual-hybrid forecast for this window, same shape as y_actual."
+    )
+    hybrid_under_prov_weight: float = Field(DEC_UNDER_WEIGHT, gt=0)
+    hybrid_safety_margin: float = Field(SAFETY_MARGIN, ge=0.0, le=1.0)
+
+
+class ShadowWindowResponse(BaseModel):
+    machine_id: str
+    window_result: dict = Field(description="arima_cost/arima_sla_pct/hybrid_cost/hybrid_sla_pct for this window.")
+    current_forecaster: str = Field(description='"arima" or "hybrid" -- the forecaster now controlling this machine.')
+    assignment_changed: bool
+    verdict: Optional[str] = Field(None, description="Set only when assignment_changed is true.")
+    n_banked_windows: int
+    cumulative: dict
+
+
+class ShadowStatusResponse(BaseModel):
+    machine_id: str
+    current_forecaster: str
+    last_evaluated_at: Optional[str]
+    n_banked_windows: int
+    cumulative: dict
+    assignment_history: List[dict]
+
+
+@app.post("/shadow/{machine_id}/window", response_model=ShadowWindowResponse, tags=["shadow"])
+def submit_shadow_window(machine_id: str, req: ShadowWindowRequest) -> ShadowWindowResponse:
+    """
+    Score one already-observed shadow window's real demand against BOTH
+    ARIMA's and the residual hybrid's forecasts for it, bank the result, and
+    re-run the assignment decision. Reuses `shadow.run_shadow_window` (which
+    itself reuses `decision._build_lstm_targets`, `simulation._run_simulation`,
+    `simulation._compute_cost_score` unmodified) and
+    `shadow.evaluate_and_maybe_reassign`. A machine only switches to the
+    hybrid once it has won every one of its last `shadow.DEFAULT_MIN_WINDOWS`
+    banked windows AND the aggregate comparison clears this project's
+    combined-±1σ statistical bar (`shadow.decide_assignment`) -- consistency
+    alone or significance alone is not enough. Neither forecaster's targets
+    are ever applied to the real fleet through this endpoint.
+    """
+    y_actual = np.array(req.y_actual, dtype=np.float32)
+    arima_pred = np.array(req.arima_forecast, dtype=np.float32)
+    hybrid_pred = np.array(req.hybrid_forecast, dtype=np.float32)
+    if not (y_actual.shape == arima_pred.shape == hybrid_pred.shape):
+        raise HTTPException(
+            status_code=400,
+            detail="y_actual, arima_forecast, and hybrid_forecast must all share the same "
+                   "(n_sequences, horizon_steps) shape.",
+        )
+
+    state = _shadow_states.setdefault(machine_id, shadow.MachineShadowState(machine_id=machine_id))
+
+    arima_dec_cfg = DecisionConfig(under_prov_weight=req.arima_under_prov_weight)
+    hybrid_dec_cfg = DecisionConfig(under_prov_weight=req.hybrid_under_prov_weight)
+    window = shadow.run_shadow_window(
+        machine_id, req.window_start, req.window_end, y_actual,
+        arima_pred, arima_dec_cfg, req.arima_safety_margin,
+        hybrid_pred, hybrid_dec_cfg, req.hybrid_safety_margin,
+        demand_scale=req.demand_scale,
+    )
+    shadow.record_shadow_window(state, window)
+    change = shadow.evaluate_and_maybe_reassign(state, datetime.now(timezone.utc))
+
+    return ShadowWindowResponse(
+        machine_id=machine_id,
+        window_result={
+            "arima_cost": window.arima_cost, "arima_sla_pct": window.arima_sla_pct,
+            "hybrid_cost": window.hybrid_cost, "hybrid_sla_pct": window.hybrid_sla_pct,
+        },
+        current_forecaster=state.current_forecaster,
+        assignment_changed=change is not None,
+        verdict=change.verdict if change else None,
+        n_banked_windows=len(state.window_results),
+        cumulative=shadow.cumulative_summary(state.window_results),
+    )
+
+
+@app.get("/shadow/{machine_id}", response_model=ShadowStatusResponse, tags=["shadow"])
+def shadow_status(machine_id: str) -> ShadowStatusResponse:
+    """Current shadow-evaluation state for one machine: which forecaster
+    controls it right now, how many shadow windows are banked, cumulative
+    cost/SLA for each forecaster, and the full history of assignment
+    changes (each with its timestamp and the evidence that triggered it)."""
+    state = _shadow_states.get(machine_id)
+    if state is None:
+        raise HTTPException(status_code=404, detail=f"No shadow state for machine_id={machine_id!r} yet.")
+    return ShadowStatusResponse(
+        machine_id=machine_id,
+        current_forecaster=state.current_forecaster,
+        last_evaluated_at=state.last_evaluated_at.isoformat() if state.last_evaluated_at else None,
+        n_banked_windows=len(state.window_results),
+        cumulative=shadow.cumulative_summary(state.window_results),
+        assignment_history=[
+            {
+                "timestamp": c.timestamp.isoformat(),
+                "old_forecaster": c.old_forecaster,
+                "new_forecaster": c.new_forecaster,
+                "verdict": c.verdict,
+                "evidence": c.evidence,
+            }
+            for c in state.assignment_history
+        ],
     )
