@@ -90,6 +90,7 @@ from .simulation import (
     verdict,
 )
 from . import shadow
+from . import metrics_source
 
 # Names that require TensorFlow -- resolved lazily, see module docstring.
 _LAZY = {
@@ -143,7 +144,7 @@ __all__ = [
     "run_single_experiment", "tune_on_validation",
     "_build_lstm_model", "_evaluate_lstm", "_evaluate_naive", "_inv", "_train_lstm",
     "SimConfig", "SimMetrics", "_compute_cost_score", "_reactive_autoscaler",
-    "_run_simulation", "verdict", "shadow",
+    "_run_simulation", "verdict", "shadow", "metrics_source",
     "run_arima_experiment", "tune_arima_on_validation", "_arima_rolling_forecast",
     "ARIMA_ORDER", "select_arima_order",
     "_arima_train_walkforward", "_inv_residual", "_inv_flat",
