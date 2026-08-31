@@ -31,6 +31,10 @@ GET  /shadow/{machine_id}  — current shadow-evaluation state for one
                              how many shadow windows are banked, cumulative
                              cost/SLA, and the full assignment-change
                              history.
+GET  /shadow/{machine_id}/windows — the full per-window audit log: every
+                             shadow window ever banked, each with both
+                             forecasters' cost/SLA for that specific
+                             window.
 
 Run from the project root:
     uvicorn src.api.main:app --reload
@@ -39,20 +43,22 @@ The service loads lstm_model.keras from the project root and fits the
 MinMaxScaler used for normalisation from m_1933's training split at startup,
 matching the split used throughout the experiment pipeline. The /shadow
 endpoints are independent of that model/scaler state — they only need
-already-computed forecast arrays and operate purely on
-src/autoscaler/shadow.py's in-memory per-machine state (module-level dict,
-same pattern as `_state` below; not persisted across restarts — a real
-deployment would back this with a database, which is out of scope here).
+already-computed forecast arrays. State is durable (Step 19): a SQLite
+file (shadow_state.db, project root by default) via
+src/autoscaler/shadow_store.py, which wraps shadow.py's unmodified
+decision logic with load-before/save-after persistence -- shadow.py
+itself has no notion of a database.
 """
 
 from __future__ import annotations
 
+import os
 import sys
 import warnings
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Dict, List, Optional
+from typing import List, Optional
 
 import numpy as np
 from fastapi import FastAPI, HTTPException
@@ -80,17 +86,18 @@ from src.autoscaler import (  # noqa: E402
     _split_three_way,
     shadow,
 )
+from src.autoscaler.shadow_store import ShadowStore, record_and_evaluate  # noqa: E402
 
 # ── Module-level state (populated at startup, read during requests) ───────────
 _state: dict = {}
 
 _MODEL_PATH = _ROOT / "lstm_model.keras"
 
-# Step 18: per-machine shadow-evaluation state (src/autoscaler/shadow.py).
-# In-memory only, same pattern as `_state` above -- does not survive a
-# restart. A real deployment would back this with a database; that's out
-# of scope for this step, which is about the harness logic itself.
-_shadow_states: Dict[str, shadow.MachineShadowState] = {}
+# Step 19: durable shadow-evaluation state (src/autoscaler/shadow_store.py),
+# a SQLite file at the project root. Overridable via env var so tests don't
+# touch the real file (see tests/test_api_shadow.py).
+_SHADOW_DB_PATH = os.environ.get("LSTM_AUTOSCALER_SHADOW_DB", str(_ROOT / "shadow_state.db"))
+_shadow_store = ShadowStore(_SHADOW_DB_PATH)
 
 
 @asynccontextmanager
@@ -327,6 +334,14 @@ class ShadowStatusResponse(BaseModel):
     assignment_history: List[dict]
 
 
+class ShadowWindowListResponse(BaseModel):
+    machine_id: str
+    windows: List[dict] = Field(
+        description="Every shadow window ever banked for this machine, oldest first -- "
+                    "window_start/window_end, arima_cost/arima_sla_pct, hybrid_cost/hybrid_sla_pct."
+    )
+
+
 @app.post("/shadow/{machine_id}/window", response_model=ShadowWindowResponse, tags=["shadow"])
 def submit_shadow_window(machine_id: str, req: ShadowWindowRequest) -> ShadowWindowResponse:
     """
@@ -352,8 +367,6 @@ def submit_shadow_window(machine_id: str, req: ShadowWindowRequest) -> ShadowWin
                    "(n_sequences, horizon_steps) shape.",
         )
 
-    state = _shadow_states.setdefault(machine_id, shadow.MachineShadowState(machine_id=machine_id))
-
     arima_dec_cfg = DecisionConfig(under_prov_weight=req.arima_under_prov_weight)
     hybrid_dec_cfg = DecisionConfig(under_prov_weight=req.hybrid_under_prov_weight)
     window = shadow.run_shadow_window(
@@ -362,8 +375,10 @@ def submit_shadow_window(machine_id: str, req: ShadowWindowRequest) -> ShadowWin
         hybrid_pred, hybrid_dec_cfg, req.hybrid_safety_margin,
         demand_scale=req.demand_scale,
     )
-    shadow.record_shadow_window(state, window)
-    change = shadow.evaluate_and_maybe_reassign(state, datetime.now(timezone.utc))
+    # Step 19: durable via ShadowStore -- loads state, calls shadow.py's
+    # unmodified record_shadow_window/evaluate_and_maybe_reassign, persists
+    # exactly what changed. See shadow_store.record_and_evaluate.
+    state, change = record_and_evaluate(_shadow_store, machine_id, window, datetime.now(timezone.utc))
 
     return ShadowWindowResponse(
         machine_id=machine_id,
@@ -383,17 +398,20 @@ def submit_shadow_window(machine_id: str, req: ShadowWindowRequest) -> ShadowWin
 def shadow_status(machine_id: str) -> ShadowStatusResponse:
     """Current shadow-evaluation state for one machine: which forecaster
     controls it right now, how many shadow windows are banked, cumulative
-    cost/SLA for each forecaster, and the full history of assignment
-    changes (each with its timestamp and the evidence that triggered it)."""
-    state = _shadow_states.get(machine_id)
-    if state is None:
+    cost/SLA for each forecaster (over ALL windows ever recorded, not just
+    the decision-relevant recent subset), and the full history of
+    assignment changes (each with its timestamp and the evidence that
+    triggered it). Backed by ShadowStore (Step 19) -- survives a restart."""
+    if not _shadow_store.has_machine(machine_id):
         raise HTTPException(status_code=404, detail=f"No shadow state for machine_id={machine_id!r} yet.")
+    state = _shadow_store.load_state(machine_id)
+    full_history = _shadow_store.get_full_window_history(machine_id)
     return ShadowStatusResponse(
         machine_id=machine_id,
         current_forecaster=state.current_forecaster,
         last_evaluated_at=state.last_evaluated_at.isoformat() if state.last_evaluated_at else None,
-        n_banked_windows=len(state.window_results),
-        cumulative=shadow.cumulative_summary(state.window_results),
+        n_banked_windows=len(full_history),
+        cumulative=shadow.cumulative_summary(full_history),
         assignment_history=[
             {
                 "timestamp": c.timestamp.isoformat(),
@@ -402,6 +420,30 @@ def shadow_status(machine_id: str) -> ShadowStatusResponse:
                 "verdict": c.verdict,
                 "evidence": c.evidence,
             }
-            for c in state.assignment_history
+            for c in _shadow_store.get_assignment_history(machine_id)
+        ],
+    )
+
+
+@app.get("/shadow/{machine_id}/windows", response_model=ShadowWindowListResponse, tags=["shadow"])
+def shadow_windows(machine_id: str) -> ShadowWindowListResponse:
+    """The full per-window audit log for one machine -- every shadow
+    window ever banked, each with both forecasters' cost/SLA for that
+    specific window (not just the cumulative aggregate `/shadow/{id}`
+    returns). This is the "watch it working" view: each row is one
+    already-made forecast + would-be scaling comparison, logged and never
+    mutated after the fact."""
+    if not _shadow_store.has_machine(machine_id):
+        raise HTTPException(status_code=404, detail=f"No shadow state for machine_id={machine_id!r} yet.")
+    windows = _shadow_store.get_full_window_history(machine_id)
+    return ShadowWindowListResponse(
+        machine_id=machine_id,
+        windows=[
+            {
+                "window_start": w.window_start.isoformat(), "window_end": w.window_end.isoformat(),
+                "arima_cost": w.arima_cost, "arima_sla_pct": w.arima_sla_pct,
+                "hybrid_cost": w.hybrid_cost, "hybrid_sla_pct": w.hybrid_sla_pct,
+            }
+            for w in windows
         ],
     )
