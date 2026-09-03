@@ -11,11 +11,23 @@
 # purpose: this is a new, independent workload, not part of the
 # kube-prometheus-stack release.
 #
-# BEFORE APPLYING: build and push the image this Deployment references
-# (see the Dockerfile's own comments and this stage's progress doc) to a
-# registry your cluster can pull from, and replace `image:` below --
-# `lstm-autoscaler-observer:latest` is a local build tag only, not
-# published anywhere.
+# BEFORE APPLYING: build the image, then push it to a registry the
+# cluster can actually see -- on a `docker-desktop` Kubernetes context
+# (kubectl config current-context), that means a throwaway local registry,
+# NOT a shared image store: Docker Desktop's Kubernetes node reads images
+# via containerd's `k8s.io` namespace, which `docker build` does not write
+# to (it writes to the separate `moby` namespace), so `imagePullPolicy:
+# Never` against a plain local build tag will hang in ErrImageNeverPull --
+# confirmed on this machine, this is not a hypothetical.
+#   docker build -t lstm-autoscaler-observer:latest .
+#   docker run -d --restart=always -p 5000:5000 --name local-registry registry:2
+#   docker tag lstm-autoscaler-observer:latest localhost:5000/lstm-autoscaler-observer:latest
+#   docker push localhost:5000/lstm-autoscaler-observer:latest
+# (see the Dockerfile's own comments and this stage's progress doc). The
+# Deployment below already references `localhost:5000/...` with
+# `imagePullPolicy: IfNotPresent`. If you deploy to a DIFFERENT cluster (a
+# remote/managed one, or `kind`), swap in a registry it can reach instead
+# (or `kind load docker-image ...`).
 #
 # Persistence: a PersistentVolumeClaim is included below (`storageClassName`
 # left unset -- uses the cluster's default StorageClass) so shadow_state.db
@@ -64,7 +76,20 @@ spec:
     spec:
       containers:
         - name: observer
-          image: lstm-autoscaler-observer:latest   # replace with your pushed image
+          image: localhost:5000/lstm-autoscaler-observer:latest
+          # CORRECTION: Docker Desktop's Kubernetes does NOT actually share
+          # `docker build`'s image store with the cluster -- kubelet reads
+          # images from containerd's `k8s.io` namespace, while `docker
+          # build` writes into the separate `moby` namespace. Confirmed on
+          # this machine: imagePullPolicy: Never left the pod stuck in
+          # ErrImageNeverPull even after a successful local build + rollout
+          # restart. Fix that actually works: run a throwaway local
+          # registry and push the image there (Docker Desktop's k8s node
+          # can reach localhost:5000 directly) --
+          #   docker run -d --restart=always -p 5000:5000 --name local-registry registry:2
+          #   docker tag lstm-autoscaler-observer:latest localhost:5000/lstm-autoscaler-observer:latest
+          #   docker push localhost:5000/lstm-autoscaler-observer:latest
+          imagePullPolicy: IfNotPresent
           ports:
             - containerPort: 8000
           env:

@@ -148,13 +148,16 @@ user needs to take and watch.
 
 ## Still open
 
-- **Not applied to the real target cluster.** No access to it from this
-  environment — `kubectl apply -f k8s/observer.yaml` (after building and
-  pushing the image, and editing the manifest's `image:` field) is the
-  next action, and it's the user's to take and verify.
-- **`image:` is a placeholder** (`lstm-autoscaler-observer:latest`) — needs
-  building and pushing to a registry the target cluster can actually pull
-  from, then editing the manifest to match.
+- ~~Not applied to the real target cluster.~~ **Resolved by Step 24**:
+  applied to a real `docker-desktop` Kubernetes cluster, pod `1/1
+  Running`, confirmed talking to real Prometheus, `shadow_state.db`
+  confirmed being written to. See that doc for what's still open beyond
+  this point (mainly: shadow_windows need ~30h of real uptime to start
+  banking).
+- ~~`image:` is a placeholder~~ **Resolved by Step 24**, via a local
+  registry (`docker-desktop` does not share `docker build`'s image store
+  with the cluster the way `imagePullPolicy: Never` alone would need —
+  see that doc).
 - **PVC's `storageClassName` is left unset** (cluster default) — untested
   against whatever the real cluster's default StorageClass actually
   provisions; may need setting explicitly depending on that cluster's
