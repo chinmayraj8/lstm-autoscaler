@@ -1,0 +1,21 @@
+{
+  "_fixture_note": "Authored to match Prometheus's documented /api/v1/query response schema for an instant-vector query exactly (status/data/resultType/result, each result a {metric, value:[unix_ts, \"stringified_float\"]} pair) -- this is NOT a literal packet capture from the user's real cluster (no network access to it from this environment). Structurally identical to what a kube-prometheus-stack Prometheus returns for: 100 * (1 - avg by (instance) (rate(node_cpu_seconds_total{mode=\"idle\"}[5m]))). Validate against the real cluster before trusting this fixture's exact field shapes in production.",
+  "status": "success",
+  "data": {
+    "resultType": "vector",
+    "result": [
+      {
+        "metric": {"instance": "10.244.1.5:9100"},
+        "value": [1767225600, "12.483921"]
+      },
+      {
+        "metric": {"instance": "10.244.1.6:9100"},
+        "value": [1767225600, "34.102756"]
+      },
+      {
+        "metric": {"instance": "10.244.1.7:9100"},
+        "value": [1767225600, "5.912004"]
+      }
+    ]
+  }
+}

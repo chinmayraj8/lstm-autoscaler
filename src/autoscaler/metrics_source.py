@@ -33,18 +33,24 @@ function just to make it reusable from here. The two must stay
 byte-identical; `tests/test_metrics_source.py` checks that directly
 against the same synthetic data through both paths.
 
-Still open (Step 20's own scope, stated plainly): no concrete real
-connector, and no live forecasting loop that calls this on a schedule --
-both wait on knowing what real monitoring system this eventually points
-at. See progress/2026-08-31_step20-metrics-source-interface.md.
+Step 20 left this interface-only, waiting on a named real system. Step 21
+(Stage 3) names one: a Kubernetes cluster running kube-prometheus-stack,
+Prometheus reachable in-cluster at
+http://kube-prometheus-stack-prometheus.monitoring.svc.cluster.local:9090,
+scraping node-exporter, machine unit = node. `PrometheusMetricsSource`
+below is the concrete connector for that system -- see its own docstring
+for why it's built on `/api/v1/query` (instant queries), not
+`/api/v1/query_range`, and for the HTTP-call-volume trade-off that choice
+implies. See progress/2026-09-03_step21-prometheus-metrics-source.md.
 """
 
 from abc import ABC, abstractmethod
 from datetime import datetime, timedelta
-from typing import Optional
+from typing import List, Optional
 
 import numpy as np
 import pandas as pd
+import requests
 
 from . import config
 
@@ -134,3 +140,164 @@ def synthetic_readings_series(start: datetime, n_points: int, cadence_minutes: i
     values = mean + amplitude * np.sin(2 * np.pi * t / max(n_points, 1) * 3) + rng.normal(0, noise_std, n_points)
     values = np.clip(values, 0.0, None)
     return pd.Series(values, index=idx, name=config.FEATURE_COL)
+
+
+# ── PrometheusMetricsSource: the real connector (Step 21 / Stage 3) ────────
+
+# In-cluster Prometheus URL (kube-prometheus-stack default Service DNS name),
+# confirmed working against the real target cluster. Overridable per
+# instance -- this default is just what a caller gets for free.
+DEFAULT_PROMETHEUS_URL = "http://kube-prometheus-stack-prometheus.monitoring.svc.cluster.local:9090"
+
+# The two pieces of the verified PromQL query that would otherwise be
+# magic strings duplicated between the query-builder and anyone reading it:
+#   100 * (1 - avg by (instance) (rate(node_cpu_seconds_total{mode="idle"}[5m])))
+DEFAULT_RANGE_VECTOR = "5m"
+CPU_IDLE_MODE_LABEL = "idle"
+
+
+def build_cpu_util_query(range_vector: str = DEFAULT_RANGE_VECTOR,
+                         idle_mode_label: str = CPU_IDLE_MODE_LABEL) -> str:
+    """Build the per-node CPU% PromQL query, parameterized so the range
+    vector and the idle-mode label are each written exactly once -- not
+    hardcoded again inside `PrometheusMetricsSource`. With the defaults,
+    reproduces byte-for-byte the query verified working against the real
+    cluster:
+
+        100 * (1 - avg by (instance) (rate(node_cpu_seconds_total{mode="idle"}[5m])))
+    """
+    return (
+        f'100 * (1 - avg by (instance) '
+        f'(rate(node_cpu_seconds_total{{mode="{idle_mode_label}"}}[{range_vector}])))'
+    )
+
+
+def instance_to_machine_id(instance_label: str) -> str:
+    """Map a Prometheus `instance` label to this project's `machine_id`.
+
+    node-exporter's `instance` label is conventionally `<host>:<port>`
+    (e.g. "10.244.1.5:9100" -- kube-prometheus-stack's default node-exporter
+    port). Every other `machine_id` in this project (the Alibaba trace CSV,
+    `StaticMetricsSource` fixtures) is a bare identifier with no port, so
+    the port suffix is stripped for consistency. A label with no ':' is
+    returned unchanged (already bare, or a cluster whose instance labels
+    don't include a port)."""
+    return instance_label.rsplit(":", 1)[0] if ":" in instance_label else instance_label
+
+
+class PrometheusMetricsSourceError(RuntimeError):
+    """Raised when Prometheus responds but not the way this connector
+    expects (a non-"success" status, or a resultType other than "vector"
+    -- the instant-query endpoint should never return anything else for
+    this query shape). Distinct from `requests` exceptions (network/HTTP
+    failures), which are left to propagate as-is."""
+
+
+class PrometheusMetricsSource(MetricsSource):
+    """Real `MetricsSource` connector for an in-cluster Prometheus running
+    kube-prometheus-stack, scraping node-exporter. Machine unit = node.
+
+    Why `/api/v1/query` (instant queries), not `/api/v1/query_range`
+    ----------------------------------------------------------------
+    The verified query is a PromQL instant-vector expression -- it already
+    embeds its own trailing window (`rate(...[5m])`), so a single instant
+    query evaluated `time=T` reads as "the rate over the 5 minutes ending
+    at T", not "the value at T with no history". Building history for
+    `fetch_readings(machine_id, start, end)` therefore means calling
+    `/api/v1/query` once per sample point across `[start, end]` at
+    `query_step_minutes` cadence (default 5, matching this project's
+    resample cadence -- see `resample_readings`), each with an explicit
+    `time=` parameter, rather than one `/api/v1/query_range` call. This is
+    less efficient (N HTTP round-trips instead of 1 for an N-point window)
+    but matches the exact endpoint and query shape verified against the
+    real cluster; see the Stage 3 progress doc for the trade-off and why
+    `query_range` was not substituted in.
+
+    Each call returns a vector (one sample per currently-scraped instance),
+    filtered here to the one row matching `machine_id` via
+    `instance_to_machine_id`.
+    """
+
+    def __init__(self, prometheus_url: str = DEFAULT_PROMETHEUS_URL,
+                range_vector: str = DEFAULT_RANGE_VECTOR,
+                idle_mode_label: str = CPU_IDLE_MODE_LABEL,
+                query_step_minutes: int = 5,
+                timeout_seconds: float = 10.0,
+                session: Optional[requests.Session] = None):
+        self.prometheus_url = prometheus_url.rstrip("/")
+        self.range_vector = range_vector
+        self.idle_mode_label = idle_mode_label
+        self.query = build_cpu_util_query(range_vector, idle_mode_label)
+        self.query_step_minutes = query_step_minutes
+        self.timeout_seconds = timeout_seconds
+        self._session = session or requests.Session()
+
+    def _query_instant(self, at: Optional[datetime] = None) -> List[dict]:
+        """One `/api/v1/query` call. `at=None` means "now" (Prometheus's own
+        default when `time` is omitted); otherwise evaluates the query as of
+        that timestamp -- Prometheus retains raw samples within its
+        retention window, so a past `time=` still works for recent history,
+        it isn't limited to "the current instant" despite the endpoint's name.
+        Returns the raw `data.result` list of `{"metric": {...}, "value": [ts, "val"]}`.
+        """
+        params = {"query": self.query}
+        if at is not None:
+            params["time"] = at.timestamp()
+        resp = self._session.get(
+            f"{self.prometheus_url}/api/v1/query", params=params, timeout=self.timeout_seconds,
+        )
+        resp.raise_for_status()
+        payload = resp.json()
+        if payload.get("status") != "success":
+            raise PrometheusMetricsSourceError(f"Prometheus query failed: {payload}")
+        data = payload.get("data", {})
+        if data.get("resultType") != "vector":
+            raise PrometheusMetricsSourceError(
+                f"Expected an instant vector, got resultType={data.get('resultType')!r}"
+            )
+        return data.get("result", [])
+
+    def fetch_readings(self, machine_id: str, start: datetime, end: datetime) -> pd.DataFrame:
+        """Raw per-node CPU% readings for `machine_id` in `[start, end]`,
+        built from repeated `/api/v1/query` calls at `query_step_minutes`
+        cadence (see class docstring). Empty (not an error) if the node
+        never appears in any sampled response -- a newly-joined node, one
+        that's since left the cluster, or a real scrape gap are all
+        legitimate reasons, matching the base contract in `fetch_readings`'s
+        docstring."""
+        if end < start:
+            raise ValueError(f"end ({end}) is before start ({start})")
+
+        step = timedelta(minutes=self.query_step_minutes)
+        timestamps: List[datetime] = []
+        values: List[float] = []
+        t = start
+        while t <= end:
+            for sample in self._query_instant(t):
+                if instance_to_machine_id(sample.get("metric", {}).get("instance", "")) == machine_id:
+                    _, val_str = sample["value"]
+                    timestamps.append(t)
+                    values.append(float(val_str))
+                    break
+            t += step
+
+        if not timestamps:
+            return pd.DataFrame({config.FEATURE_COL: []}, index=pd.DatetimeIndex([], name="time_stamp"))
+        return pd.DataFrame(
+            {config.FEATURE_COL: values},
+            index=pd.DatetimeIndex(timestamps, name="time_stamp"),
+        )
+
+    def list_machine_ids(self, at: Optional[datetime] = None) -> List[str]:
+        """Discover every node currently (or, with `at`, previously) visible
+        to this query -- one instant query, mapped through
+        `instance_to_machine_id` and deduplicated. NOT part of the
+        `MetricsSource` ABC contract (a synthetic/offline source has no
+        notion of "what nodes exist right now"); this is an extension
+        specific to a live connector, used by the Stage 4 scheduler for
+        node discovery when no explicit tracked-node list is configured."""
+        ids = {
+            instance_to_machine_id(sample.get("metric", {}).get("instance", ""))
+            for sample in self._query_instant(at)
+        }
+        return sorted(i for i in ids if i)

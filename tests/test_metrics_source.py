@@ -1,15 +1,23 @@
 """Unit tests for the metrics-ingestion interface (src/autoscaler/metrics_source.py).
 
-No TensorFlow, no real dataset, no network -- MetricsSource is interface-
-only at this stage (Step 20): no concrete real connector exists yet, so
-these tests exercise the ABC contract via StaticMetricsSource (a synthetic
-reference implementation, not a stand-in for a real system) and check
-resample_readings against data._prepare_timeseries's resample step
-directly, on the same synthetic data, to back up the "byte-identical
-convention" claim in the module docstring.
+No TensorFlow, no real dataset, no network. Two groups of tests:
+
+- The interface/StaticMetricsSource tests from Step 20, unchanged: exercise
+  the ABC contract via StaticMetricsSource (a synthetic reference
+  implementation, not a stand-in for a real system) and check
+  resample_readings against data._prepare_timeseries's resample step
+  directly, on the same synthetic data.
+- PrometheusMetricsSource tests (Step 21 / Stage 3): a mocked
+  `requests.Session` returning the fixture in
+  tests/fixtures/prometheus_instant_query_response.json (see that file's
+  own note on provenance) -- no live cluster dependency, matching this
+  step's explicit instruction.
 """
 
+import json
 from datetime import datetime, timedelta
+from pathlib import Path
+from unittest.mock import MagicMock
 
 import numpy as np
 import pandas as pd
@@ -19,12 +27,17 @@ from src.autoscaler import config
 from src.autoscaler.data import _prepare_timeseries
 from src.autoscaler.metrics_source import (
     MetricsSource,
+    PrometheusMetricsSource,
+    PrometheusMetricsSourceError,
     StaticMetricsSource,
+    build_cpu_util_query,
+    instance_to_machine_id,
     resample_readings,
     synthetic_readings_series,
 )
 
 T0 = datetime(2026, 1, 1)
+_FIXTURE_PATH = Path(__file__).parent / "fixtures" / "prometheus_instant_query_response.json"
 
 
 # ── resample_readings vs. data._prepare_timeseries: same convention ────────
@@ -123,3 +136,121 @@ def test_fetch_lookback_window_on_machine_with_no_data_is_empty():
     source = StaticMetricsSource({})
     window = source.fetch_lookback_window("m_never_seen", T0)
     assert window.empty
+
+
+# ── PrometheusMetricsSource (Step 21 / Stage 3) ─────────────────────────────
+
+def _load_fixture() -> dict:
+    with open(_FIXTURE_PATH) as f:
+        return json.load(f)
+
+
+def _mock_session(payload: dict) -> MagicMock:
+    """A `requests.Session`-shaped mock whose `.get(...)` always returns
+    `payload` as JSON with a 200 status (`raise_for_status` a no-op)."""
+    session = MagicMock()
+    response = MagicMock()
+    response.json.return_value = payload
+    response.raise_for_status.return_value = None
+    session.get.return_value = response
+    return session
+
+
+def test_build_cpu_util_query_matches_the_verified_query():
+    assert build_cpu_util_query() == (
+        '100 * (1 - avg by (instance) '
+        '(rate(node_cpu_seconds_total{mode="idle"}[5m])))'
+    )
+
+
+def test_build_cpu_util_query_parameterizes_range_vector_and_idle_label():
+    q = build_cpu_util_query(range_vector="1m", idle_mode_label="idle_mode")
+    assert "[1m]" in q
+    assert 'mode="idle_mode"' in q
+    assert "[5m]" not in q
+
+
+def test_instance_to_machine_id_strips_port():
+    assert instance_to_machine_id("10.244.1.5:9100") == "10.244.1.5"
+
+
+def test_instance_to_machine_id_leaves_bare_label_unchanged():
+    assert instance_to_machine_id("node-a") == "node-a"
+
+
+def test_fetch_readings_queries_instant_endpoint_and_filters_to_machine_id():
+    payload = _load_fixture()
+    session = _mock_session(payload)
+    source = PrometheusMetricsSource(session=session, query_step_minutes=5)
+
+    result = source.fetch_readings("10.244.1.6", T0, T0)  # single-step window
+
+    assert session.get.call_args.args[0].endswith("/api/v1/query")
+    assert session.get.call_args.kwargs["params"]["query"] == source.query
+    assert "time" in session.get.call_args.kwargs["params"]
+    assert list(result[config.FEATURE_COL]) == pytest.approx([34.102756])
+    assert result.index[0] == T0
+
+
+def test_fetch_readings_unknown_machine_returns_empty():
+    session = _mock_session(_load_fixture())
+    source = PrometheusMetricsSource(session=session)
+    result = source.fetch_readings("10.244.9.9", T0, T0)
+    assert result.empty
+    assert list(result.columns) == [config.FEATURE_COL]
+
+
+def test_fetch_readings_multiple_steps_issues_one_call_per_step():
+    session = _mock_session(_load_fixture())
+    source = PrometheusMetricsSource(session=session, query_step_minutes=5)
+
+    result = source.fetch_readings("10.244.1.5", T0, T0 + timedelta(minutes=15))
+
+    assert session.get.call_count == 4  # T0, +5, +10, +15
+    assert len(result) == 4
+    assert (result[config.FEATURE_COL] == 12.483921).all()
+
+
+def test_fetch_readings_rejects_end_before_start():
+    source = PrometheusMetricsSource(session=_mock_session(_load_fixture()))
+    with pytest.raises(ValueError):
+        source.fetch_readings("10.244.1.5", T0, T0 - timedelta(minutes=5))
+
+
+def test_fetch_readings_raises_on_non_success_status():
+    session = _mock_session({"status": "error", "error": "bad query"})
+    source = PrometheusMetricsSource(session=session)
+    with pytest.raises(PrometheusMetricsSourceError):
+        source.fetch_readings("10.244.1.5", T0, T0)
+
+
+def test_fetch_readings_raises_on_non_vector_result_type():
+    session = _mock_session({"status": "success", "data": {"resultType": "matrix", "result": []}})
+    source = PrometheusMetricsSource(session=session)
+    with pytest.raises(PrometheusMetricsSourceError):
+        source.fetch_readings("10.244.1.5", T0, T0)
+
+
+def test_list_machine_ids_returns_sorted_deduplicated_ids():
+    session = _mock_session(_load_fixture())
+    source = PrometheusMetricsSource(session=session)
+    assert source.list_machine_ids() == ["10.244.1.5", "10.244.1.6", "10.244.1.7"]
+
+
+def test_fetch_readings_output_feeds_resample_readings_unchanged():
+    # The whole point of Stage 3: real (here, mocked) Prometheus data must
+    # land in the exact shape data._prepare_timeseries already produces, via
+    # the SAME resample_readings Step 20 built and verified.
+    session = _mock_session(_load_fixture())
+    source = PrometheusMetricsSource(session=session, query_step_minutes=5)
+    raw = source.fetch_readings("10.244.1.5", T0, T0 + timedelta(minutes=25))
+    out = resample_readings(raw)
+    assert list(out.columns) == [config.FEATURE_COL]
+    assert not out[config.FEATURE_COL].isna().any()
+
+
+def test_default_prometheus_url_matches_the_confirmed_in_cluster_target():
+    source = PrometheusMetricsSource(session=_mock_session(_load_fixture()))
+    assert source.prometheus_url == (
+        "http://kube-prometheus-stack-prometheus.monitoring.svc.cluster.local:9090"
+    )
