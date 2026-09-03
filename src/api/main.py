@@ -58,6 +58,19 @@ the live loop are unaffected, since neither ever touches that model.
 including in the live loop -- it only ever reads Prometheus and writes to
 `_shadow_store`.**
 
+Step 25: `LSTM_AUTOSCALER_SHADOW_FIT_HOURS`/`LSTM_AUTOSCALER_SHADOW_WINDOW_HOURS`
+override `LiveLoopConfig`'s `shadow_fit_hours`/`shadow_window_hours`
+(defaults 6/24 -- the real 30h-of-history methodology), the same way
+`LSTM_AUTOSCALER_TICK_SECONDS` already overrode `tick_seconds`. Unset by
+default; only ever meant to be set small for a deliberately-flagged demo
+run (see progress/2026-09-03_step25-hybrid-path-mechanical-demo.md), never
+left small in a real deployment. `LSTM_AUTOSCALER_HYBRID_MODEL_DIR`
+(read directly by `live_loop.py`, not by this module) points
+`_load_hybrid_residual_model` at a directory of per-machine `.keras`
+residual models -- defaults to `models/hybrid_residual`, a path that has
+never contained a real trained model (see Step 22's and Step 25's progress
+docs).
+
 Run from the project root:
     uvicorn src.api.main:app --reload
 
@@ -74,6 +87,7 @@ itself has no notion of a database.
 
 from __future__ import annotations
 
+import logging
 import os
 import sys
 import threading
@@ -86,6 +100,21 @@ from typing import List, Optional
 import numpy as np
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel, Field
+
+# Step 25: without a configured handler, the `autoscaler.*` module loggers
+# (shadow.py, live_loop.py -- every logger.info/.warning/.exception call
+# they make, including the live loop's per-tick "observed" line and any
+# exception it catches) are silently dropped: Python's logging module only
+# auto-prints WARNING+ via a bare last-resort handler, and even that never
+# fires for the module loggers here specifically once uvicorn's own logging
+# setup runs (it configures the root logger, at which point the "no handler
+# configured anywhere" condition no longer holds, but the *level* uvicorn
+# sets doesn't include this project's INFO-level operational logs). This
+# was invisible until Step 25 needed to debug the live loop's actual
+# per-tick behavior on the real cluster via `kubectl logs` and found nothing
+# -- a real, previously-unnoticed observability gap in a project whose
+# whole point since Step 18 has been "watch it running," not just trust it.
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
 
 # Ensure the project root is on sys.path so experiments.pipeline is importable
 # whether this module is run as `uvicorn src.api.main:app` from the root or
@@ -187,8 +216,23 @@ async def lifespan(app: FastAPI):
         from src.autoscaler.metrics_source import PrometheusMetricsSource
 
         prom_source = PrometheusMetricsSource(prometheus_url=_PROMETHEUS_URL)
-        tick_seconds = int(os.environ.get("LSTM_AUTOSCALER_TICK_SECONDS", LiveLoopConfig().tick_seconds))
-        loop_cfg = LiveLoopConfig(tick_seconds=tick_seconds)
+        _default_cfg = LiveLoopConfig()
+        tick_seconds = int(os.environ.get("LSTM_AUTOSCALER_TICK_SECONDS", _default_cfg.tick_seconds))
+        # Step 25: shadow_fit_hours/shadow_window_hours are overridable the
+        # same way tick_seconds already was. Production has no reason to set
+        # either (the 6h/24h code defaults are the real methodology) -- these
+        # exist so a deliberate, explicitly-flagged demo run (see
+        # progress/2026-09-03_step25-*.md) can shrink them to minutes without
+        # editing code, not so they get left small by default.
+        shadow_fit_hours = float(os.environ.get("LSTM_AUTOSCALER_SHADOW_FIT_HOURS", _default_cfg.shadow_fit_hours))
+        shadow_window_hours = float(
+            os.environ.get("LSTM_AUTOSCALER_SHADOW_WINDOW_HOURS", _default_cfg.shadow_window_hours)
+        )
+        loop_cfg = LiveLoopConfig(
+            tick_seconds=tick_seconds,
+            shadow_fit_hours=shadow_fit_hours,
+            shadow_window_hours=shadow_window_hours,
+        )
 
         def _get_tracked_ids():
             return resolve_tracked_machine_ids(prom_source)

@@ -56,22 +56,53 @@ docker push localhost:5000/lstm-autoscaler-observer:latest
 IfNotPresent`, and its comments rewritten to document this as the actual
 path for a `docker-desktop` context, not "still needs a registry, TBD."
 
-## 0 observed shadow_windows, 0 assignment_changes: expected, not a gap
+## 0 observed shadow_windows, 0 assignment_changes: NOT just "needs more uptime"
 
-Worth stating explicitly since it could otherwise look broken.
-`run_scheduler_loop` (Step 22, `live_loop.py`) needs `shadow_fit_hours`
-(6h) + `shadow_window_hours` (24h) = **30h** of real Prometheus history for
-a machine before `run_tick` can score even the first shadow window
-(`shadow.run_shadow_window`) — `evaluate_and_maybe_reassign` never runs,
-so no `AssignmentChange` can exist, until at least one window is banked.
+**Correction (Step 25):** this section originally said the reason
+`shadow_windows`/`assignment_changes` were still empty was that a machine
+needs 30h of real Prometheus history before the first shadow window can be
+scored, and that this was "expected, not a gap" — just a matter of waiting.
+**That explanation was incomplete to the point of being misleading.**
+Step 25 traced the actual code path and found two structural blockers that
+mean `shadow_windows`/`assignment_changes` can never appear on their own,
+at ANY wall-clock time, no matter how long this deployment runs
+unattended:
 
-6 `observed_decisions` at the 5-minute tick cadence
-(`LSTM_AUTOSCALER_TICK_SECONDS=300`) is roughly 30 minutes of uptime —
-nowhere near 30 hours. The always-on single-forecaster ARIMA path
+1. `run_tick` (`live_loop.py`) only attempts shadow-window scoring
+   `if state.current_forecaster == "hybrid"`. But the ONLY thing that ever
+   sets `current_forecaster` to `"hybrid"` is `evaluate_and_maybe_reassign`
+   — which is itself only ever reached from INSIDE that same
+   hybrid-gated path (`run_tick` → `run_shadow_cycle` →
+   `maybe_run_shadow_cycle` → `evaluate_and_maybe_reassign`). A machine
+   starting on the database default (`"arima"`) can never organically
+   become eligible to be evaluated for hybrid assignment — this is a
+   closed loop with no entry point, not a slow ramp.
+2. Even a machine manually pushed to `"hybrid"` would immediately hit
+   `HybridModelUnavailable`: no `.keras` residual-hybrid model exists
+   anywhere in this repository for any machine (only the unrelated
+   original `lstm_model.keras` from the early single-machine steps).
+
+So the true reason 0/0 held at Step 24's writing wasn't "needs ~30h more
+uptime" — it was that nothing in this deployment, run for any amount of
+time, could ever produce a `shadow_window` without deliberate manual
+intervention (seeding an assignment directly in the database, and
+providing a residual model file). Step 25 does exactly that — as an
+explicit, flagged mechanical demo, not a real forecasting result — to
+prove the scoring pipeline itself works once those two blockers are
+worked around by hand. See that step's progress doc for what was actually
+done and verified.
+
+The now-corrected but still true parts of the original explanation: 6
+`observed_decisions` at the 5-minute tick cadence
+(`LSTM_AUTOSCALER_TICK_SECONDS=300`) reflected roughly 30 minutes of
+uptime at the time of writing. The always-on single-forecaster ARIMA path
 (`observe_node_once`, populating `observed_decisions`) and the
 shadow-comparison path (`maybe_run_shadow_cycle`, populating
-`shadow_windows`/`assignment_changes`) run on two different cadences by
-design (Step 22); only the first has had time to produce anything yet.
+`shadow_windows`/`assignment_changes`) do run on two different cadences by
+design (Step 22) — that part was accurate. What was wrong was implying the
+second path would eventually produce something on its own given enough
+elapsed time; it structurally cannot, without the intervention Step 25
+performed.
 
 ## Before → After
 
@@ -82,16 +113,20 @@ design (Step 22); only the first has had time to produce anything yet.
 | Prometheus connectivity | Validated against mocks / local port-forward only | Confirmed live: real CPU values for 2 node-exporter instances |
 | Shadow state persistence | Validated locally only (Step 19) | Confirmed PVC-backed and actively written to on the real cluster |
 | observed_decisions | 0 | 6 |
-| shadow_windows / assignment_changes | 0 / 0 (untestable — no cluster access) | 0 / 0 (expected — needs ~30h more uptime, not a defect) |
+| shadow_windows / assignment_changes | 0 / 0 (untestable — no cluster access) | 0 / 0 (see correction above — a structural gating issue, not just elapsed time; see Step 25) |
 
 ## Still open
 
 Unchanged from Step 23 except where noted:
 
-- **shadow_windows / assignment_changes still empty** — needs real
-  wall-clock time (~30h minimum per machine) before the first one can even
-  be attempted. Worth checking again once that much uptime has
-  accumulated, not before.
+- ~~shadow_windows / assignment_changes still empty — needs real wall-clock
+  time (~30h minimum per machine) before the first one can even be
+  attempted~~ — **corrected by Step 25**: this was never just a matter of
+  elapsed time. Two structural blockers (the hybrid-assignment closed loop,
+  and no residual-hybrid model existing anywhere) mean these tables cannot
+  populate on their own at all, regardless of uptime. See Step 25's
+  progress doc for the full trace and a mechanical demo proving the
+  scoring pipeline works once those blockers are worked around by hand.
 - **No scale-up/scale-down call to real infrastructure exists anywhere in
   this codebase.** Unchanged, out of scope by design — this step doesn't
   move that boundary.

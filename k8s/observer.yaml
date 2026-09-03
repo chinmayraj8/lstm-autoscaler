@@ -76,7 +76,7 @@ spec:
     spec:
       containers:
         - name: observer
-          image: localhost:5000/lstm-autoscaler-observer:latest
+          image: localhost:5000/lstm-autoscaler-observer:step25
           # CORRECTION: Docker Desktop's Kubernetes does NOT actually share
           # `docker build`'s image store with the cluster -- kubelet reads
           # images from containerd's `k8s.io` namespace, while `docker
@@ -87,8 +87,23 @@ spec:
           # registry and push the image there (Docker Desktop's k8s node
           # can reach localhost:5000 directly) --
           #   docker run -d --restart=always -p 5000:5000 --name local-registry registry:2
-          #   docker tag lstm-autoscaler-observer:latest localhost:5000/lstm-autoscaler-observer:latest
-          #   docker push localhost:5000/lstm-autoscaler-observer:latest
+          #   docker tag lstm-autoscaler-observer:latest localhost:5000/lstm-autoscaler-observer:<tag>
+          #   docker push localhost:5000/lstm-autoscaler-observer:<tag>
+          # SECOND CORRECTION (Step 25): don't reuse `:latest` as that <tag>
+          # once a pod has already pulled it once. `imagePullPolicy:
+          # IfNotPresent` means exactly what it says -- kubelet checks
+          # whether that IMAGE REFERENCE (repo+tag) is already present on
+          # the node, not whether the registry's content under that tag has
+          # changed, so re-pushing `:latest` with new content and then just
+          # restarting the pod (even via `kubectl rollout restart`) silently
+          # keeps serving the STALE cached build -- confirmed on this
+          # machine (Step 25: a rebuilt image with a real logging fix in it
+          # didn't take effect until re-tagged). Use a unique tag per build
+          # you need the cluster to actually pick up (a version, a git SHA,
+          # a timestamp -- `step25` here is just this step's own marker, not
+          # a versioning scheme to keep using) and update this field to
+          # match, or delete/recreate the pod after removing the stale image
+          # from the node.
           imagePullPolicy: IfNotPresent
           ports:
             - containerPort: 8000
@@ -109,6 +124,28 @@ spec:
             # loop discovers tracked nodes itself each tick via
             # PrometheusMetricsSource.list_machine_ids() (Step 21). Set this
             # to a comma-separated list instead if you want a fixed node set.
+            #
+            # Placeholder residual-hybrid model directory (Step 25), on the
+            # PVC so it survives a restart like shadow_state.db does.
+            # Left wired (an empty directory today -- Step 25's one-off
+            # placeholder .keras file was deleted after that step's demo,
+            # see its progress doc's "Decision" section) so a real model
+            # can be dropped in later without a manifest change. Its mere
+            # presence would never, on its own, mean the hybrid forecaster
+            # is validated for real use -- that still requires a real
+            # trained artifact, which does not exist.
+            - name: LSTM_AUTOSCALER_HYBRID_MODEL_DIR
+              value: "/data/hybrid_residual"
+            # LSTM_AUTOSCALER_SHADOW_FIT_HOURS/_WINDOW_HOURS: intentionally
+            # UNSET here. Step 25 temporarily overrode these (to ~1h
+            # instead of the code defaults 6h/24h = 30h) to mechanically
+            # demo the ARIMA-vs-hybrid shadow-window scoring pipeline
+            # against a cluster that didn't have 30h of history yet --
+            # see that step's progress doc for what was proven and why.
+            # Reverted after: this deployment now runs the real 6h-fit/
+            # 24h-window methodology again (LiveLoopConfig's code
+            # defaults). Do not re-add these as small values outside of a
+            # similarly explicit, flagged, temporary demo.
           volumeMounts:
             - name: shadow-state
               mountPath: /data
@@ -125,12 +162,26 @@ spec:
             initialDelaySeconds: 10
             periodSeconds: 30
           resources:
+            # Step 25: bumped from the original 256Mi/512Mi (Step 23's "sane
+            # starting guess," never actually exercised against a real
+            # TensorFlow model load) after directly observing an OOMKilled
+            # container at 512Mi while loading the placeholder hybrid model
+            # (a second, separate TF process via `kubectl exec` alongside
+            # the already-TF-loaded main process -- the main process's own
+            # in-process tick did NOT crash the pod, but this wasn't margin
+            # this deployment had verified before, and the observer-only
+            # ARIMA path (Steps 21-24) never loads a Keras model at all, so
+            # 512Mi was never actually tested against this cluster's real
+            # TensorFlow footprint until this step. Left at the higher
+            # value going forward rather than reverted, since the hybrid
+            # path (dormant but wired since Step 22) can legitimately be
+            # exercised again later and would hit the same ceiling.
             requests:
               cpu: 100m
-              memory: 256Mi
+              memory: 512Mi
             limits:
               cpu: 500m
-              memory: 512Mi
+              memory: 1Gi
       volumes:
         - name: shadow-state
           persistentVolumeClaim:
