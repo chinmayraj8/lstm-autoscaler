@@ -1,0 +1,22 @@
+# Keep the observer image minimal (Step 23, Stage 5) -- none of this is
+# needed to run src/api/main.py + src/autoscaler/live_loop.py.
+venv/
+__pycache__/
+*.py[cod]
+.ipynb_checkpoints/
+_to_delete/
+experiments/
+docs/
+outputs/
+notebooks/
+*.ipynb
+*.csv
+*.keras
+.git/
+.gitignore
+.dockerignore
+Dockerfile
+k8s/
+progress/
+tests/
+README.md

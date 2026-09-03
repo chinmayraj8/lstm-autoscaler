@@ -1,0 +1,23 @@
+# Runtime dependencies for the FastAPI service (src/api/main.py), used by
+# the Dockerfile (Step 23, Stage 5 -- the minimal in-cluster observer
+# runner). NOT the same as the local dev/notebook setup in README.md, which
+# installs the macOS-specific `tensorflow-macos`/`tensorflow-metal` build
+# for local Apple Silicon GPU training -- this file pins the standard,
+# Linux-compatible `tensorflow` package instead, for a container. Versions
+# match what's installed in this project's own dev venv (see this file's
+# own progress doc for how they were checked), not arbitrarily chosen.
+#
+# main.py imports `_build_lstm_model` at module level (see
+# tests/test_api_shadow.py's own docstring on this), so tensorflow is a
+# real import-time dependency of this service even when
+# LSTM_AUTOSCALER_SKIP_LSTM_MODEL=1 skips actually loading a model at
+# startup -- it cannot be dropped from this file for the observer image.
+fastapi==0.141.1
+uvicorn==0.52.4
+pydantic==2.13.4
+numpy==1.26.4
+pandas==2.3.3
+scikit-learn==1.8.0
+statsmodels==0.14.6
+tensorflow==2.16.2
+requests==2.33.1

@@ -1,0 +1,125 @@
+# Minimal in-cluster runner for the observer service (Step 23, Stage 5).
+#
+# Scope, stated plainly: JUST enough to run Stage 4's live forecasting loop
+# + the /shadow/* FastAPI endpoints continuously inside the cluster,
+# talking to Prometheus via in-cluster DNS -- not the broader Part 2
+# Docker/Kubernetes deployment work. No HorizontalPodAutoscaler, no
+# NetworkPolicy, no Ingress, no resource-limit tuning beyond a sane
+# starting guess, no RBAC (this service only ever makes outbound HTTP GETs
+# to Prometheus -- it never talks to the Kubernetes API, so no
+# ServiceAccount/Role is needed). A separate namespace from `monitoring` on
+# purpose: this is a new, independent workload, not part of the
+# kube-prometheus-stack release.
+#
+# BEFORE APPLYING: build and push the image this Deployment references
+# (see the Dockerfile's own comments and this stage's progress doc) to a
+# registry your cluster can pull from, and replace `image:` below --
+# `lstm-autoscaler-observer:latest` is a local build tag only, not
+# published anywhere.
+#
+# Persistence: a PersistentVolumeClaim is included below (`storageClassName`
+# left unset -- uses the cluster's default StorageClass) so shadow_state.db
+# survives a pod restart/reschedule. This was a deliberate choice this
+# stage was asked to make explicitly, not a default: SQLite (Step 19) is
+# single-writer-friendly, matching this Deployment's `replicas: 1` --
+# scaling replicas beyond 1 against the SAME PVC path would need a
+# different store, not just a bigger claim, so don't raise `replicas`
+# without addressing that first. See the progress doc's "Still open" for
+# what this PVC does NOT solve (untested against the real cluster's actual
+# default StorageClass; no backup/snapshot policy).
+
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: lstm-autoscaler
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: observer-shadow-state
+  namespace: lstm-autoscaler
+spec:
+  accessModes:
+    - ReadWriteOnce
+  resources:
+    requests:
+      storage: 1Gi
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: lstm-autoscaler-observer
+  namespace: lstm-autoscaler
+  labels:
+    app: lstm-autoscaler-observer
+spec:
+  replicas: 1   # see PVC note above before ever raising this
+  selector:
+    matchLabels:
+      app: lstm-autoscaler-observer
+  template:
+    metadata:
+      labels:
+        app: lstm-autoscaler-observer
+    spec:
+      containers:
+        - name: observer
+          image: lstm-autoscaler-observer:latest   # replace with your pushed image
+          ports:
+            - containerPort: 8000
+          env:
+            # Confirmed working in-cluster Prometheus URL (kube-prometheus-stack
+            # default Service DNS name).
+            - name: LSTM_AUTOSCALER_PROMETHEUS_URL
+              value: "http://kube-prometheus-stack-prometheus.monitoring.svc.cluster.local:9090"
+            # No CSV dataset or lstm_model.keras in this image -- /forecast
+            # returns 503; /shadow/* and the live loop are unaffected.
+            - name: LSTM_AUTOSCALER_SKIP_LSTM_MODEL
+              value: "1"
+            - name: LSTM_AUTOSCALER_SHADOW_DB
+              value: "/data/shadow_state.db"
+            - name: LSTM_AUTOSCALER_TICK_SECONDS
+              value: "300"
+            # LSTM_AUTOSCALER_TRACKED_NODES intentionally unset -- the live
+            # loop discovers tracked nodes itself each tick via
+            # PrometheusMetricsSource.list_machine_ids() (Step 21). Set this
+            # to a comma-separated list instead if you want a fixed node set.
+          volumeMounts:
+            - name: shadow-state
+              mountPath: /data
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: 8000
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: 8000
+            initialDelaySeconds: 10
+            periodSeconds: 30
+          resources:
+            requests:
+              cpu: 100m
+              memory: 256Mi
+            limits:
+              cpu: 500m
+              memory: 512Mi
+      volumes:
+        - name: shadow-state
+          persistentVolumeClaim:
+            claimName: observer-shadow-state
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: lstm-autoscaler-observer
+  namespace: lstm-autoscaler
+spec:
+  selector:
+    app: lstm-autoscaler-observer
+  ports:
+    - port: 80
+      targetPort: 8000
+  type: ClusterIP
