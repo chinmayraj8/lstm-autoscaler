@@ -67,7 +67,7 @@ node id, sorted. Not part of the `MetricsSource` ABC (a synthetic/offline
 source has no notion of "what nodes exist right now") — an extension
 specific to a live connector, for Stage 4's node-discovery.
 
-**Tests (`tests/test_metrics_source.py`, +14 new, `tests/fixtures/prometheus_instant_query_response.json`
+**Tests (`tests/test_metrics_source.py`, +13 new, `tests/fixtures/prometheus_instant_query_response.json`
 new)**: a mocked `requests.Session` (`unittest.mock.MagicMock`) returning
 the fixture — no live cluster dependency, per this step's explicit
 instruction. The fixture's own top-level `_fixture_note` field says
@@ -87,7 +87,7 @@ dedupes and sorts; **`fetch_readings`'s output feeds `resample_readings`
 (Step 20, unchanged) without error** — the same "lands in the exact shape
 `data._prepare_timeseries` already produces" claim Step 20 made for
 `StaticMetricsSource`, now checked for the real connector's output shape
-too. **112/112 project tests pass** (98 pre-existing + 14 new).
+too. **103/103 project tests pass** (90 pre-existing + 13 new).
 
 ## Before → After
 
@@ -97,7 +97,7 @@ too. **112/112 project tests pass** (98 pre-existing + 14 new).
 | Concrete `MetricsSource` connector | None | `PrometheusMetricsSource`, tested against a mocked HTTP response |
 | Verified query | N/A | `100 * (1 - avg by (instance) (rate(node_cpu_seconds_total{mode="idle"}[5m])))`, parameterized via `build_cpu_util_query` |
 | Live forecasting loop | None | Still none (Stage 4, next) |
-| Test count | 98 | 112 |
+| Test count | 90 | 103 |
 
 ## Impact
 

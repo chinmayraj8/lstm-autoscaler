@@ -38,8 +38,21 @@ Concurrency: a fresh `sqlite3.connect()` per operation (this harness is
 explicitly observe-only, low-frequency by design -- see shadow.py's module
 docstring -- so connection-pooling complexity isn't warranted at this
 stage).
+
+Step 22 (Stage 4, live forecasting loop) addition: a fourth table,
+`observed_decisions`, and a `last_recommended_servers` column on
+`machines`. This is a SEPARATE concern from the three tables above --
+those back shadow.py's ARIMA-vs-hybrid comparison/gating logic (which
+needs BOTH forecasters' numbers for a window to mean anything);
+`observed_decisions` logs each individual tick's single-forecaster
+decision (whichever forecaster is currently assigned) for every tracked
+node, whether or not that node has a hybrid comparison running. See
+`live_loop.py`'s module docstring for why the live loop treats these as
+two distinct logging paths rather than forcing every tick through
+shadow.py's two-forecaster data model.
 """
 
+import json
 import sqlite3
 import threading
 from contextlib import contextmanager
@@ -81,7 +94,30 @@ CREATE TABLE IF NOT EXISTS assignment_changes (
 );
 CREATE INDEX IF NOT EXISTS idx_assignment_changes_machine
     ON assignment_changes(machine_id, timestamp, id);
+
+CREATE TABLE IF NOT EXISTS observed_decisions (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    machine_id TEXT NOT NULL,
+    observed_at TEXT NOT NULL,
+    forecaster TEXT NOT NULL,
+    forecast_cpu_pct TEXT NOT NULL,
+    planned_load_pct REAL NOT NULL,
+    current_servers INTEGER NOT NULL,
+    recommended_servers INTEGER NOT NULL,
+    action TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_observed_decisions_machine
+    ON observed_decisions(machine_id, observed_at, id);
 """
+
+# Additive migration for pre-Step-22 database files: `machines` may already
+# exist (via CREATE TABLE IF NOT EXISTS above) without this column. SQLite
+# has no "ADD COLUMN IF NOT EXISTS"; the ShadowStore constructor below
+# attempts the ALTER and ignores the "duplicate column" error it raises on
+# a database that already has it.
+_MACHINES_ADD_LAST_RECOMMENDED_SERVERS = (
+    "ALTER TABLE machines ADD COLUMN last_recommended_servers INTEGER"
+)
 
 
 class ShadowStore:
@@ -104,6 +140,11 @@ class ShadowStore:
             self._persistent_conn = sqlite3.connect(db_path, check_same_thread=False)
         with self._connect() as conn:
             conn.executescript(_SCHEMA)
+            try:
+                conn.execute(_MACHINES_ADD_LAST_RECOMMENDED_SERVERS)
+            except sqlite3.OperationalError as e:
+                if "duplicate column" not in str(e).lower():
+                    raise
 
     @contextmanager
     def _connect(self):
@@ -221,6 +262,65 @@ class ShadowStore:
         with self._connect() as conn:
             rows = conn.execute("SELECT machine_id FROM machines ORDER BY machine_id").fetchall()
         return [r[0] for r in rows]
+
+    # ── Observed decisions (Step 22, Stage 4 live loop) ─────────────────────
+    # A separate, simpler log from the shadow_windows/assignment_changes
+    # tables above: one row per tick per tracked node, whichever forecaster
+    # is currently assigned -- not a two-forecaster comparison. See module
+    # docstring.
+
+    def get_last_recommended_servers(self, machine_id: str, default: int) -> int:
+        """The live loop's running "shadow server count" for one node --
+        purely a logging construct (nothing here ever calls a real scaling
+        API), fed back as next tick's `current_servers` the same way
+        `_build_lstm_targets` iterates `current_servers = new_target`
+        internally. `default` is the caller's choice for a never-seen node
+        (typically `config.SIM_INITIAL_SERVERS`)."""
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT last_recommended_servers FROM machines WHERE machine_id = ?", (machine_id,),
+            ).fetchone()
+        if row is None or row[0] is None:
+            return default
+        return int(row[0])
+
+    def record_observed_decision(self, machine_id: str, observed_at: datetime, forecaster: str,
+                                 forecast_cpu_pct: List[float], planned_load_pct: float,
+                                 current_servers: int, recommended_servers: int, action: str) -> None:
+        with self._connect() as conn:
+            conn.execute("INSERT OR IGNORE INTO machines (machine_id) VALUES (?)", (machine_id,))
+            conn.execute(
+                "INSERT INTO observed_decisions "
+                "(machine_id, observed_at, forecaster, forecast_cpu_pct, planned_load_pct, "
+                " current_servers, recommended_servers, action) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                (machine_id, observed_at.isoformat(), forecaster, json.dumps(forecast_cpu_pct),
+                 planned_load_pct, current_servers, recommended_servers, action),
+            )
+            conn.execute(
+                "UPDATE machines SET last_recommended_servers = ? WHERE machine_id = ?",
+                (recommended_servers, machine_id),
+            )
+
+    def get_observed_decisions(self, machine_id: str, limit: int = 500) -> List[dict]:
+        """Most recent `limit` observed decisions for this node, oldest
+        first (log-tail semantics) -- the "watch real decisions accumulate"
+        view Stage 4 was asked to expose."""
+        with self._connect() as conn:
+            rows = conn.execute(
+                "SELECT observed_at, forecaster, forecast_cpu_pct, planned_load_pct, "
+                "current_servers, recommended_servers, action FROM observed_decisions "
+                "WHERE machine_id = ? ORDER BY observed_at DESC, id DESC LIMIT ?",
+                (machine_id, limit),
+            ).fetchall()
+        rows = list(reversed(rows))
+        return [
+            {
+                "observed_at": r[0], "forecaster": r[1],
+                "forecast_cpu_pct": json.loads(r[2]), "planned_load_pct": r[3],
+                "current_servers": r[4], "recommended_servers": r[5], "action": r[6],
+            }
+            for r in rows
+        ]
 
     # ── Writes (called only by the orchestration functions below) ──────────
 

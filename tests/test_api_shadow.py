@@ -122,3 +122,63 @@ def test_machines_are_isolated_over_http():
     assert a["cumulative"]["n_windows"] == 1
     assert b["cumulative"]["n_windows"] == 1
     assert a["cumulative"] != b["cumulative"]
+
+
+# ── /shadow/{machine_id}/decisions (Step 22, Stage 4 live loop) ────────────
+
+def test_decisions_endpoint_empty_for_unseen_machine_not_404():
+    # Unlike /shadow/{id} and /shadow/{id}/windows, a log endpoint returns
+    # an empty list rather than 404 -- "never observed yet" is an ordinary
+    # state here, not evidence the shadow-comparison gate has an opinion.
+    r = client.get("/shadow/m_never_seen/decisions")
+    assert r.status_code == 200
+    assert r.json() == {"machine_id": "m_never_seen", "decisions": []}
+
+
+def test_decisions_endpoint_reflects_observed_decisions_from_the_store():
+    from datetime import datetime, timezone
+    main_module._shadow_store.record_observed_decision(
+        "m_test", datetime(2026, 1, 1, tzinfo=timezone.utc), forecaster="arima",
+        forecast_cpu_pct=[5.1, 5.3, 5.2], planned_load_pct=142.5,
+        current_servers=2, recommended_servers=2, action="hold",
+    )
+    r = client.get("/shadow/m_test/decisions")
+    assert r.status_code == 200
+    body = r.json()
+    assert body["machine_id"] == "m_test"
+    assert len(body["decisions"]) == 1
+    d = body["decisions"][0]
+    assert d["forecaster"] == "arima"
+    assert d["forecast_cpu_pct"] == [5.1, 5.3, 5.2]
+    assert d["action"] == "hold"
+    assert d["recommended_servers"] == 2
+
+
+# ── /health (Step 22 additions) ─────────────────────────────────────────────
+# `client` (module-level, no `with`) never runs `lifespan` in this test
+# file's established style (see the module docstring: these tests need
+# neither lstm_model.keras nor the real dataset), so `_state` stays `{}`
+# and `/health` correctly 503s over HTTP here -- that's the SAME behavior
+# `/health` always had before Step 22, not a regression. These two tests
+# call the route function directly against a manually-populated `_state`,
+# the same way `_fresh_store` pokes `main_module._shadow_store` directly
+# rather than trying to make a real lifespan run in this file.
+
+def test_health_503_before_state_is_populated():
+    main_module._state.clear()
+    with pytest.raises(main_module.HTTPException) as exc_info:
+        main_module.health()
+    assert exc_info.value.status_code == 503
+
+
+def test_health_reports_live_loop_and_model_flags_once_started():
+    main_module._state.clear()
+    main_module._state["started_at"] = "2026-01-01T00:00:00+00:00"
+    try:
+        body = main_module.health()
+    finally:
+        main_module._state.clear()
+    assert body.status == "ok"
+    assert body.lstm_model_loaded is False   # "model" never put into _state above
+    assert body.live_loop_running is False   # no live-loop thread started in this test
+    assert body.machine_id is None

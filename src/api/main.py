@@ -35,6 +35,28 @@ GET  /shadow/{machine_id}/windows — the full per-window audit log: every
                              shadow window ever banked, each with both
                              forecasters' cost/SLA for that specific
                              window.
+GET  /shadow/{machine_id}/decisions — Step 22: the live forecasting loop's
+                             per-tick observed-decision log for one node --
+                             every tick's forecast + would-be scaling
+                             action, logged for every tracked node whether
+                             or not it has an active hybrid comparison
+                             running. Populated only once the live loop is
+                             actually running (see below).
+
+Step 22 (Stage 4): if `LSTM_AUTOSCALER_PROMETHEUS_URL` is set at startup,
+a background thread polls that in-cluster Prometheus URL on a schedule
+(`src/autoscaler/live_loop.py`) and logs both per-tick ARIMA decisions
+(`/shadow/{machine_id}/decisions`) and, for nodes already assigned to the
+residual hybrid, live shadow-window comparisons
+(`/shadow/{machine_id}/windows`) through the SAME `_shadow_store` these
+endpoints read. Unset (the default), no background thread starts. Set
+`LSTM_AUTOSCALER_SKIP_LSTM_MODEL` to start this service without the LSTM
+model/scaler (which needs the local Kaggle CSV, not present in a minimal
+deployment) -- `/forecast` then returns 503; every `/shadow/*` endpoint and
+the live loop are unaffected, since neither ever touches that model.
+**No scaling call to real infrastructure exists anywhere in this service,
+including in the live loop -- it only ever reads Prometheus and writes to
+`_shadow_store`.**
 
 Run from the project root:
     uvicorn src.api.main:app --reload
@@ -54,6 +76,7 @@ from __future__ import annotations
 
 import os
 import sys
+import threading
 import warnings
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
@@ -99,43 +122,96 @@ _MODEL_PATH = _ROOT / "lstm_model.keras"
 _SHADOW_DB_PATH = os.environ.get("LSTM_AUTOSCALER_SHADOW_DB", str(_ROOT / "shadow_state.db"))
 _shadow_store = ShadowStore(_SHADOW_DB_PATH)
 
+# Step 22 (Stage 4): set to skip loading the LSTM model + fitting its scaler
+# from the local Kaggle CSV at startup. The /shadow/* endpoints (and the live
+# forecasting loop below) never touch either -- only /forecast does. A
+# minimal observer deployment (Stage 5) has neither the CSV nor a reason to
+# pay TensorFlow's model-load cost, so it sets this. Unset (the default),
+# nothing about this service's existing behavior changes.
+_SKIP_LSTM_MODEL = os.environ.get("LSTM_AUTOSCALER_SKIP_LSTM_MODEL", "").strip().lower() in {"1", "true", "yes"}
+
+# Step 22 (Stage 4): if set, the live forecasting loop starts as a background
+# thread at startup, polling this in-cluster Prometheus URL on a schedule
+# (src/autoscaler/live_loop.py) and logging observed decisions / shadow
+# windows through the same _shadow_store the /shadow/* endpoints read. Unset
+# (the default, e.g. in tests and local dev without a real cluster), no
+# background thread starts and nothing about this service's existing
+# behavior changes. See live_loop.py's module docstring for exactly what
+# this loop does and does not do -- it never calls a real scaling API.
+_PROMETHEUS_URL = os.environ.get("LSTM_AUTOSCALER_PROMETHEUS_URL", "").strip() or None
+_live_loop_stop_event = threading.Event()
+_live_loop_thread: Optional[threading.Thread] = None
+
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    """Load the Keras model and fit the scaler on startup."""
+    """Load the Keras model and fit the scaler on startup (unless
+    LSTM_AUTOSCALER_SKIP_LSTM_MODEL is set), then optionally start the live
+    forecasting loop (if LSTM_AUTOSCALER_PROMETHEUS_URL is set)."""
     warnings.filterwarnings("ignore")
-    import tensorflow as tf  # deferred — keeps import time fast when testing
 
-    if not _MODEL_PATH.exists():
-        raise FileNotFoundError(
-            f"Model file not found: {_MODEL_PATH}\n"
-            "Re-run the notebook to regenerate lstm_model.keras."
+    if _SKIP_LSTM_MODEL:
+        print("[startup] LSTM_AUTOSCALER_SKIP_LSTM_MODEL set — skipping LSTM model/scaler load. "
+              "/forecast will return 503; /shadow/* is unaffected.")
+    else:
+        import tensorflow as tf  # deferred — keeps import time fast when testing
+
+        if not _MODEL_PATH.exists():
+            raise FileNotFoundError(
+                f"Model file not found: {_MODEL_PATH}\n"
+                "Re-run the notebook to regenerate lstm_model.keras."
+            )
+
+        # Build architecture fresh (avoids Keras config-version deserialization errors)
+        # then load weights from the saved file.
+        print(f"[startup] Building model architecture and loading weights from {_MODEL_PATH} …")
+        model = _build_lstm_model(LOOKBACK_STEPS, HORIZON_STEPS)
+        model.load_weights(str(_MODEL_PATH))
+        print(f"[startup] Model ready  "
+              f"input={model.input_shape}  output={model.output_shape}")
+
+        print("[startup] Fitting scaler on m_1933 training split …", flush=True)
+        ts, machine_id = _load_and_prepare()          # picks the most-sampled machine
+        _, _, _, scaler = _split_three_way(ts, FEATURE_COL)
+        print(f"[startup] Scaler ready  machine={machine_id}  "
+              f"CPU% range [{scaler.data_min_[0]:.3f}, {scaler.data_max_[0]:.3f}]")
+
+        _state.update(model=model, scaler=scaler, machine_id=machine_id, ts_len=len(ts))
+
+    _state["started_at"] = datetime.now(timezone.utc).isoformat()
+
+    global _live_loop_thread
+    live_loop_thread = None
+    if _PROMETHEUS_URL:
+        from src.autoscaler.live_loop import LiveLoopConfig, resolve_tracked_machine_ids, run_scheduler_loop
+        from src.autoscaler.metrics_source import PrometheusMetricsSource
+
+        prom_source = PrometheusMetricsSource(prometheus_url=_PROMETHEUS_URL)
+        tick_seconds = int(os.environ.get("LSTM_AUTOSCALER_TICK_SECONDS", LiveLoopConfig().tick_seconds))
+        loop_cfg = LiveLoopConfig(tick_seconds=tick_seconds)
+
+        def _get_tracked_ids():
+            return resolve_tracked_machine_ids(prom_source)
+
+        _live_loop_stop_event.clear()
+        live_loop_thread = threading.Thread(
+            target=run_scheduler_loop,
+            args=(_shadow_store, prom_source, _get_tracked_ids, loop_cfg),
+            kwargs={"stop_event": _live_loop_stop_event},
+            daemon=True, name="live-forecasting-loop",
         )
+        live_loop_thread.start()
+        print(f"[startup] Live forecasting loop started against {_PROMETHEUS_URL} "
+              f"(tick={tick_seconds}s). Observe-only — no scaling call anywhere in this path.")
 
-    # Build architecture fresh (avoids Keras config-version deserialization errors)
-    # then load weights from the saved file.
-    print(f"[startup] Building model architecture and loading weights from {_MODEL_PATH} …")
-    model = _build_lstm_model(LOOKBACK_STEPS, HORIZON_STEPS)
-    model.load_weights(str(_MODEL_PATH))
-    print(f"[startup] Model ready  "
-          f"input={model.input_shape}  output={model.output_shape}")
-
-    print("[startup] Fitting scaler on m_1933 training split …", flush=True)
-    ts, machine_id = _load_and_prepare()          # picks the most-sampled machine
-    _, _, _, scaler = _split_three_way(ts, FEATURE_COL)
-    print(f"[startup] Scaler ready  machine={machine_id}  "
-          f"CPU% range [{scaler.data_min_[0]:.3f}, {scaler.data_max_[0]:.3f}]")
-
-    _state.update(
-        model=model,
-        scaler=scaler,
-        machine_id=machine_id,
-        ts_len=len(ts),
-        started_at=datetime.now(timezone.utc).isoformat(),
-    )
+    _live_loop_thread = live_loop_thread
 
     yield
 
+    if live_loop_thread is not None:
+        _live_loop_stop_event.set()
+        live_loop_thread.join(timeout=5)
+    _live_loop_thread = None
     _state.clear()
     print("[shutdown] State cleared.")
 
@@ -217,7 +293,15 @@ class ForecastResponse(BaseModel):
 
 class HealthResponse(BaseModel):
     status: str
-    machine_id: str
+    lstm_model_loaded: bool = Field(
+        description="False if LSTM_AUTOSCALER_SKIP_LSTM_MODEL was set at startup — "
+                    "/forecast returns 503 in that case; /shadow/* is unaffected."
+    )
+    live_loop_running: bool = Field(
+        description="True if LSTM_AUTOSCALER_PROMETHEUS_URL was set at startup and the "
+                    "background live forecasting loop thread is alive."
+    )
+    machine_id: Optional[str] = None
     model_path: str
     lookback_steps: int
     lookback_minutes: int
@@ -230,12 +314,18 @@ class HealthResponse(BaseModel):
 
 @app.get("/health", response_model=HealthResponse, tags=["ops"])
 def health() -> HealthResponse:
-    """Liveness check. Returns 503 if the model has not finished loading."""
-    if "model" not in _state:
-        raise HTTPException(status_code=503, detail="Model not yet loaded.")
+    """Liveness check. Returns 503 only if startup hasn't finished at all
+    (e.g. still loading, or a real startup failure). Does NOT require the
+    LSTM model specifically — `LSTM_AUTOSCALER_SKIP_LSTM_MODEL` (Step 22)
+    lets a minimal observer deployment start without it; check
+    `lstm_model_loaded` for that, not the overall status."""
+    if "started_at" not in _state:
+        raise HTTPException(status_code=503, detail="Still starting up.")
     return HealthResponse(
         status="ok",
-        machine_id=_state["machine_id"],
+        lstm_model_loaded="model" in _state,
+        live_loop_running=_live_loop_thread is not None and _live_loop_thread.is_alive(),
+        machine_id=_state.get("machine_id"),
         model_path=str(_MODEL_PATH),
         lookback_steps=LOOKBACK_STEPS,
         lookback_minutes=LOOKBACK_STEPS * 5,
@@ -339,6 +429,20 @@ class ShadowWindowListResponse(BaseModel):
     windows: List[dict] = Field(
         description="Every shadow window ever banked for this machine, oldest first -- "
                     "window_start/window_end, arima_cost/arima_sla_pct, hybrid_cost/hybrid_sla_pct."
+    )
+
+
+class ObservedDecisionListResponse(BaseModel):
+    machine_id: str
+    decisions: List[dict] = Field(
+        description="Individual ticks of the live forecasting loop (Step 22), oldest first: "
+                    "observed_at, forecaster, forecast_cpu_pct, planned_load_pct, current_servers "
+                    "(a logging-only running count, never a real fleet size), recommended_servers, "
+                    "action. Logged for EVERY tracked node every tick, regardless of which "
+                    "forecaster it's assigned to -- unlike /shadow/{machine_id}/windows, which only "
+                    "has rows for nodes with an active ARIMA-vs-hybrid comparison. Never the result "
+                    "of a real scaling call -- this endpoint only ever reflects what the live loop "
+                    "observed and would have recommended."
     )
 
 
@@ -446,4 +550,23 @@ def shadow_windows(machine_id: str) -> ShadowWindowListResponse:
             }
             for w in windows
         ],
+    )
+
+
+@app.get("/shadow/{machine_id}/decisions", response_model=ObservedDecisionListResponse, tags=["shadow"])
+def shadow_decisions(machine_id: str, limit: int = 500) -> ObservedDecisionListResponse:
+    """The live forecasting loop's per-tick observed-decision log (Step 22)
+    for one node: every tick's forecast + would-be scaling action, whether
+    or not that node has an active hybrid comparison running. This is the
+    primary "watch real decisions accumulate" view -- populated only once
+    the live loop is actually running against a real cluster
+    (`LSTM_AUTOSCALER_PROMETHEUS_URL` set at startup; see `/health`'s
+    `live_loop_running` field). Empty (not 404) for a tracked-but-not-yet-
+    observed machine, or one this service has never heard of -- both are
+    ordinary states for a log endpoint, unlike `/shadow/{machine_id}`'s
+    404-if-unseen (which reflects the shadow-comparison gate having an
+    opinion, not just whether logging happened)."""
+    return ObservedDecisionListResponse(
+        machine_id=machine_id,
+        decisions=_shadow_store.get_observed_decisions(machine_id, limit=limit),
     )

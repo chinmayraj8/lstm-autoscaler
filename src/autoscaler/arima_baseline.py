@@ -217,6 +217,34 @@ def _arima_rolling_forecast(train_flat, context_flat, target_flat,
     return np.array(y_pred_sc), np.array(y_true_sc)
 
 
+def _arima_forecast_once(history_flat: np.ndarray, horizon: int, order=ARIMA_ORDER) -> np.ndarray:
+    """Fit ARIMA on `history_flat` (scaled [0, 1], same convention as
+    `_arima_rolling_forecast`) and forecast `horizon` steps past the end of
+    it -- one shot, no walk-forward loop. Step 22 (Stage 4, live forecasting
+    loop): unlike every other caller in this file, a live tick has no
+    already-known future `target_flat` to roll through (that's what's being
+    predicted) -- `_arima_rolling_forecast` is shaped for backtesting
+    against already-observed data, not for forecasting into the genuine
+    unobserved future, so it doesn't fit this call site. This function
+    extracts exactly the fit-and-forecast primitive `_arima_rolling_forecast`
+    already uses internally (same `ARIMA` class, same `order`, same
+    `np.clip(..., 0.0, 1.0)` convention for scaled output) without its
+    rolling/walk-forward machinery, rather than reimplementing the fit call
+    from scratch.
+
+    Returns shape `(horizon,)`, still in scaled [0, 1] space -- inverse-
+    transform with the same `MinMaxScaler` `history_flat` was scaled with,
+    e.g. via `_inv_flat(forecast.reshape(1, -1), scaler)`.
+    """
+    from statsmodels.tsa.arima.model import ARIMA
+
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        fit = ARIMA(history_flat, order=order).fit()
+        fc = fit.forecast(steps=horizon)
+    return np.clip(fc, 0.0, 1.0)
+
+
 def _forecast_and_score(y_pred_scaled, y_true_scaled, scaler):
     """Inverse-transform + RMSE/MAE, mirroring forecasting._evaluate_lstm's return shape."""
     y_pred_real = _inv_flat(y_pred_scaled, scaler)
