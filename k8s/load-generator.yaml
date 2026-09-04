@@ -1,0 +1,99 @@
+# Step 28: a real, variable, but bounded CPU load generator -- see this
+# repo's progress/2026-09-04_step28-real-hybrid-model.md for the full
+# reasoning. Short version: this project's live forecasting loop reads
+# real NODE-level CPU from Prometheus/node-exporter, but an idle Docker
+# Desktop VM has essentially nothing worth forecasting on it. Training a
+# "real" hybrid model against flat idle noise would be real in name only.
+# This DaemonSet creates genuine, real, bounded CPU pressure on every node
+# this cluster has -- the same honesty standard already applied to
+# demo-workload (Step 26): this is a deliberate, clearly-labeled
+# SYNTHETIC signal, not real production traffic, and is never described
+# as anything else.
+#
+# DaemonSet, not a single Deployment: this project tracks whichever nodes
+# Prometheus discovers live (see live_loop.py's resolve_tracked_machine_ids
+# and Step 27's progress doc on why 172.18.0.2 went stale) -- one pod per
+# node guarantees every currently-tracked node gets real load, without
+# this manifest needing to know real node names or IPs, which change
+# across Docker Desktop restarts.
+#
+# Bounded on purpose: --cpu 1 (a single core) and a load ceiling of 65%,
+# with a hard resource limit of 1 CPU, so this cannot make the host
+# machine unusable for whoever is also using it for everything else
+# during the days this needs to keep running.
+#
+# Randomized, not a clean repeating waveform: an EARLIER version of this
+# file used a fixed 8-phase / 15-minutes-per-phase ramp (10% -> 25% ->
+# 45% -> 65% -> 45% -> 25% -> 10% -> 0%, repeating exactly every 2 hours).
+# That is real CPU load, but it is a perfectly periodic, trivially
+# learnable signal -- an LSTM (or even ARIMA) can memorize an exact
+# repeating waveform without learning anything resembling how to forecast
+# genuinely irregular load, which is the same "too easy / not
+# representative" problem this project has already flagged about relying
+# on a single canned dataset. This version keeps the same seasonal SHAPE
+# (a ramp up and back down) as a base, but jitters both the target load%
+# of each phase (+/-10 points around its base, still clamped to [0, 65])
+# and each phase's duration (10-20 minutes instead of a fixed 15) using
+# /dev/urandom on every iteration -- so the exact waveform never repeats
+# twice, while total load stays inside the same safe bound as before.
+# This is still a synthetic signal, not real production traffic -- it's
+# just no longer a signal a model could solve by memorizing one period.
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: cpu-load-generator
+  namespace: lstm-autoscaler
+  labels:
+    app: cpu-load-generator
+spec:
+  selector:
+    matchLabels:
+      app: cpu-load-generator
+  template:
+    metadata:
+      labels:
+        app: cpu-load-generator
+    spec:
+      containers:
+        - name: stress-ng
+          image: polinux/stress-ng:latest
+          resources:
+            requests:
+              cpu: "100m"
+              memory: "32Mi"
+            limits:
+              cpu: "1"
+              memory: "64Mi"
+          command: ["/bin/sh", "-c"]
+          args:
+            - |
+              echo "cpu-load-generator: starting the randomized ramp cycle on $(hostname)";
+
+              # Prints an integer in [0, $1) using /dev/urandom -- portable
+              # to a minimal /bin/sh (no bash $RANDOM, no awk dependency;
+              # od and /dev/urandom are present in effectively every Linux
+              # container image, this one included).
+              rand_range() {
+                n=$(od -An -N2 -tu2 /dev/urandom | tr -d ' ')
+                echo $(( n % $1 ))
+              }
+
+              MAX_LOAD=65
+
+              while true; do
+                for base in 10 25 45 65 45 25 10 0; do
+                  jitter=$(( $(rand_range 21) - 10 ))          # -10..+10
+                  pct=$(( base + jitter ))
+                  if [ "$pct" -lt 0 ]; then pct=0; fi
+                  if [ "$pct" -gt "$MAX_LOAD" ]; then pct=$MAX_LOAD; fi
+
+                  dur=$(( 600 + $(rand_range 601) ))            # 600..1200s (10-20m)
+
+                  echo "cpu-load-generator: $(date -u +%FT%TZ) load=${pct}% for ${dur}s";
+                  if [ "$pct" -eq 0 ]; then
+                    sleep "$dur";
+                  else
+                    stress-ng --cpu 1 --cpu-load "$pct" --timeout "${dur}s";
+                  fi
+                done
+              done
