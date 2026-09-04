@@ -17,7 +17,6 @@ from datetime import datetime, timedelta
 import pytest
 
 from src.autoscaler.shadow import (
-    DEFAULT_MIN_WINDOWS,
     ShadowWindowResult,
     cumulative_summary,
 )

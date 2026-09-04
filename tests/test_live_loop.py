@@ -27,7 +27,7 @@ from src.autoscaler.live_loop import (
     run_tick,
 )
 from src.autoscaler.metrics_source import StaticMetricsSource, synthetic_readings_series
-from src.autoscaler.shadow import AssignmentChange, ShadowWindowResult
+from src.autoscaler.shadow import AssignmentChange
 from src.autoscaler.shadow_store import ShadowStore
 
 T0 = datetime(2026, 1, 1)

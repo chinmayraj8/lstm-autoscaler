@@ -183,8 +183,6 @@ async def lifespan(app: FastAPI):
         print("[startup] LSTM_AUTOSCALER_SKIP_LSTM_MODEL set — skipping LSTM model/scaler load. "
               "/forecast will return 503; /shadow/* is unaffected.")
     else:
-        import tensorflow as tf  # deferred — keeps import time fast when testing
-
         if not _MODEL_PATH.exists():
             raise FileNotFoundError(
                 f"Model file not found: {_MODEL_PATH}\n"

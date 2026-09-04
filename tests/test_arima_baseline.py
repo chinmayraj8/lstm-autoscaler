@@ -10,7 +10,6 @@ are exercised by experiments/run_arima_in_sim.py, not here.
 """
 
 import numpy as np
-import pandas as pd
 from sklearn.preprocessing import MinMaxScaler
 
 from src.autoscaler.arima_baseline import _arima_rolling_forecast, _inv_flat

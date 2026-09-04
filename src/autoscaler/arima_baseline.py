@@ -50,7 +50,7 @@ from sklearn.preprocessing import MinMaxScaler
 from . import config
 from .data import _load_and_prepare, _split_three_way
 from .decision import DecisionConfig, _build_lstm_targets
-from .simulation import SimConfig, _compute_cost_score, _reactive_autoscaler, _run_simulation
+from .simulation import SimConfig, _compute_cost_score, _run_simulation
 
 ARIMA_ORDER = (2, 0, 1)   # same order selected a priori in Step 6 -- frozen
                           # unchanged through Steps 8-13; Step 14 adds

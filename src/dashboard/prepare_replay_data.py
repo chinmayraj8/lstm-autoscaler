@@ -33,7 +33,6 @@ from src.autoscaler import (  # noqa: E402
     HORIZON_STEPS,
     LOOKBACK_STEPS,
     TEST_RATIO,
-    VAL_RATIO,
     DecisionConfig,
     SimConfig,
     _build_lstm_model,
@@ -115,7 +114,6 @@ def _action_labels(server_counts: np.ndarray) -> list:
 
 def build_replay_trace(machine_id: str, cfg: dict, seed: int = SEED) -> tuple:
     """Runs one train+test pass and returns (per-step DataFrame, meta dict)."""
-    import time
     import tensorflow as tf
 
     np.random.seed(seed)
@@ -141,7 +139,6 @@ def build_replay_trace(machine_id: str, cfg: dict, seed: int = SEED) -> tuple:
 
     model = _build_lstm_model(LOOKBACK_STEPS, HORIZON_STEPS)
     model_path = os.path.join(_DATA_DIR, f"_tmp_{machine_id}.keras")
-    t0 = time.time()
     history, wall_clock_secs = _train_lstm(model, X_train, y_train, model_path)
     epochs_trained = len(history.history["loss"])
     print(f"  trained {epochs_trained} epochs in {wall_clock_secs:.1f}s")

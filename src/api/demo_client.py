@@ -25,27 +25,25 @@ from __future__ import annotations
 import argparse
 import sys
 import time
+import warnings
 from pathlib import Path
 
 import numpy as np
 import requests
 
+warnings.filterwarnings("ignore")
+
 _ROOT = Path(__file__).resolve().parents[2]
 if str(_ROOT) not in sys.path:
     sys.path.insert(0, str(_ROOT))
 
-import warnings
-warnings.filterwarnings("ignore")
-
 from src.autoscaler import (  # noqa: E402
     DEMAND_SCALE,
     FEATURE_COL,
-    HORIZON_STEPS,
     LOOKBACK_STEPS,
     SAFETY_MARGIN,
     TEST_RATIO,
     _load_and_prepare,
-    _split_three_way,
 )
 
 
@@ -99,7 +97,7 @@ def main() -> None:
 
     # 1. Verify server is up
     health = _check_server(args.url)
-    print(f"\nServer OK")
+    print("\nServer OK")
     print(f"  Model machine : {health['machine_id']}")
     print(f"  Lookback      : {health['lookback_steps']} steps "
           f"({health['lookback_minutes']} min)")

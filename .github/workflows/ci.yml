@@ -1,0 +1,77 @@
+# Step 27: CI -- lint + test on every push/PR to main.
+#
+# Three jobs, deliberately kept separate rather than combined into one:
+#
+#   lint       -- ruff, using this repo's own pyproject.toml rule
+#                 selection (pyflakes + pycodestyle error classes only --
+#                 see that file's comment for why the broader default
+#                 ruleset isn't used: it flags this project's intentional
+#                 patterns, like the documented per-tick "log it, move on"
+#                 broad `except Exception:` convention, as bugs).
+#
+#   test-fast  -- the bulk of tests/, WITHOUT installing TensorFlow.
+#                 tests/conftest.py has said since it was written that
+#                 this suite "is meant to run fast, in CI, without a
+#                 TensorFlow install" (src/autoscaler/__init__.py only
+#                 eagerly imports config/calibration/data/decision/
+#                 simulation/shadow/metrics_source/live_loop -- none of
+#                 which need TensorFlow; see that file's own docstring).
+#                 This job is what finally makes that documented claim
+#                 true, rather than just asserted. Skips
+#                 tests/test_api_shadow.py, the one file that imports
+#                 src/api/main.py (which imports TensorFlow at module
+#                 level to build the LSTM model).
+#
+#   test-full  -- the complete suite, with the exact pinned
+#                 requirements.txt used by the real Docker image (Step 23),
+#                 so this job is also a standing check that the production
+#                 dependency set actually installs and the app actually
+#                 imports cleanly.
+#
+# Both test jobs install pinned versions from requirements.txt (the same
+# file the Dockerfile uses), not "whatever's latest" -- reproducible
+# rather than a moving target.
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - run: pip install ruff==0.16.6
+      - run: ruff check src/ tests/
+
+  test-fast:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Install everything except TensorFlow
+        run: |
+          grep -v '^tensorflow' requirements.txt > /tmp/requirements-fast.txt
+          pip install -r /tmp/requirements-fast.txt -r requirements-dev.txt
+      - name: Run the TensorFlow-free suite
+        run: pytest tests/ --ignore=tests/test_api_shadow.py -v
+
+  test-full:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Install the exact production dependency set (Dockerfile parity)
+        run: pip install -r requirements.txt -r requirements-dev.txt
+      - name: Run the full suite, including TensorFlow-dependent tests
+        run: pytest tests/ -v

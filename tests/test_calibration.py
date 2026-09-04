@@ -6,7 +6,6 @@ reconstruction (see progress/ and docs/): the calibration target is 115% of
 ONE server's capacity, and feasibility is a p99 check, not p95.
 """
 
-import numpy as np
 import pandas as pd
 
 from src.autoscaler.calibration import calibrate_demand_scale, check_feasibility

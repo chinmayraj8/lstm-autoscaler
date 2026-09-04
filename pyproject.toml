@@ -1,0 +1,13 @@
+# Lint configuration for CI (Step 27) -- see progress/2026-09-04_step27-ci.md
+# for why this rule set was chosen. Deliberately narrow: ruff's own default
+# rule selection (as of 0.16.x) pulls in a much broader set (pyupgrade,
+# flake8-comprehensions, flake8-simplify, flake8-datetimez, flake8-bandit,
+# etc.) that flag this codebase's established, intentional patterns as
+# errors -- e.g. this project's documented "log it, move on" per-tick error
+# handling (see live_loop.py's module docstring) is a broad `except
+# Exception:` on purpose in many places, which flake8-bandit's BLE001 would
+# flag as a bug. E4/E7/E9/F is pyflakes + pycodestyle's error classes --
+# real correctness issues (unused imports/variables, undefined names,
+# syntax errors) -- without relitigating this project's style choices.
+[tool.ruff.lint]
+select = ["E4", "E7", "E9", "F"]
