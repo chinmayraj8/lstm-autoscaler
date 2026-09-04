@@ -6,6 +6,7 @@ No TensorFlow needed -- this module is pure numpy/dataclass logic.
 """
 
 import numpy as np
+import pytest
 
 from src.autoscaler.decision import (
     DecisionConfig,
@@ -119,7 +120,19 @@ def test_multistep_penalty_dilutes_a_single_step_spike_relative_to_a_sustained_p
     assert _compute_penalty(1, float(np.max(plateau)), cfg) == old_engine_penalty_both_cases
     # New engine scores the spike far below the plateau.
     assert spike_multistep < plateau_multistep
-    assert plateau_multistep == old_engine_penalty_both_cases  # plateau: mean == max when uniform
+    # plateau: mean == max when uniform -- mathematically exact, but
+    # np.mean() over 10 identical values and a direct scalar computation
+    # don't always take the same floating-point reduction path, so an
+    # exact `==` here is a real flake: it passed locally on this session's
+    # arm64 dev machine but failed the first real CI run on GitHub's
+    # x86_64 runner (3.9999999999999996 != 4.0, a 1-ULP difference from
+    # summation order, not a numpy-version issue -- pinning numpy did NOT
+    # fix this, contrary to what this project's Step 27 progress doc
+    # originally assumed before that CI run was actually observed).
+    # pytest.approx is the correct fix: it's still checking the two
+    # penalties are the same value, just without demanding bit-for-bit
+    # identical floating-point rounding across architectures.
+    assert plateau_multistep == pytest.approx(old_engine_penalty_both_cases)
 
 
 def test_decide_scaling_multistep_holds_for_brief_spike_where_greedy_scales_up():

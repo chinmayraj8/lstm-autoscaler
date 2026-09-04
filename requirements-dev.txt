@@ -3,3 +3,9 @@
 #   venv/bin/pip install -r requirements-dev.txt
 #   venv/bin/python -m pytest tests/ -v
 pytest>=8.0
+# starlette's TestClient (used by fastapi.testclient, which
+# tests/test_api_shadow.py imports) requires httpx2 to be installed --
+# found by Step 27's CI (test-full failed on this before it was added
+# here; RuntimeError: "The starlette.testclient module requires the
+# httpx2 package to be installed").
+httpx2
