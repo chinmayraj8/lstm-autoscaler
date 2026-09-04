@@ -7,10 +7,15 @@ Step 21 (Stage 3) built `PrometheusMetricsSource`, a real, tested
 scheduled loop that does: on a tick (`run_tick`, meant to be called every
 `LiveLoopConfig.tick_seconds`, default 5 minutes), for every tracked node,
 pull real history, run ARIMA through the existing, unmodified forecasting
-and decision-engine code, and log the result. **No scaling call exists
-anywhere in this module or anything it calls** -- every function here
-either returns a value or writes a log row via `ShadowStore`; none of them
-can reach a real fleet.
+and decision-engine code, and log the result. Through Step 25, no scaling
+call existed anywhere in this module or anything it called -- every
+function here either returned a value or wrote a log row via `ShadowStore`.
+Step 26 adds exactly one real scaling call (`actuator.set_replicas`,
+imported lazily inside `run_tick`, matching this module's existing
+TensorFlow-isolation convention), gated behind
+`LiveLoopConfig.enable_actuation` (default `False`) -- see "Path 3" below.
+With actuation disabled (the default), this module's behavior is
+byte-for-byte what it was through Step 25: observe and log only.
 
 Two separate logging paths, not one
 -------------------------------------
@@ -93,6 +98,12 @@ DEFAULT_FIT_LOOKBACK_HOURS = 3.0           # history pulled each tick for the AR
 DEFAULT_SHADOW_WINDOW_HOURS = 24.0         # the "24h" a shadow window has meant since Step 18
 DEFAULT_SHADOW_FIT_HOURS = 6.0             # history pulled to fit ARIMA before rolling through the shadow window
 DEFAULT_HYBRID_MODEL_DIR = os.environ.get("LSTM_AUTOSCALER_HYBRID_MODEL_DIR", "models/hybrid_residual")
+# Step 26 -- real actuation defaults. Namespace matches k8s/observer.yaml's
+# own Namespace object; deployment name matches k8s/demo-workload.yaml's
+# clearly-labeled demo target (see that manifest and actuator.py's module
+# docstring for why a demo target, not a real service, is what gets scaled).
+DEFAULT_ACTUATION_DEPLOYMENT = os.environ.get("LSTM_AUTOSCALER_ACTUATION_DEPLOYMENT", "demo-workload")
+DEFAULT_ACTUATION_NAMESPACE = os.environ.get("LSTM_AUTOSCALER_ACTUATION_NAMESPACE", "lstm-autoscaler")
 TRACKED_NODES_ENV_VAR = "LSTM_AUTOSCALER_TRACKED_NODES"
 
 # ARIMA(2,0,1) needs more observations than its own parameter count to fit
@@ -117,6 +128,18 @@ class LiveLoopConfig:
     under_prov_weight: float = config.DEC_UNDER_WEIGHT
     order: Tuple[int, int, int] = ARIMA_ORDER
     hybrid_model_dir: str = DEFAULT_HYBRID_MODEL_DIR
+    # Step 26 -- real actuation, off by default. `enable_actuation=False`
+    # (the default) means run_tick's actuation branch never even imports
+    # `actuator`, let alone calls it -- this project's safe, observe-only
+    # behavior through Step 25 stays the default, not something that can
+    # be silently switched on by forgetting a flag. `actuation_machine_id`
+    # picks exactly ONE tracked node's recommendation to actuate from --
+    # not an aggregate across nodes, deliberately, so "why did it scale"
+    # always traces to one real forecast, never a blend.
+    enable_actuation: bool = False
+    actuation_machine_id: Optional[str] = None
+    actuation_deployment: str = DEFAULT_ACTUATION_DEPLOYMENT
+    actuation_namespace: str = DEFAULT_ACTUATION_NAMESPACE
 
 
 # ── Path 1: always-on, single-forecaster observed decisions ─────────────────
@@ -285,17 +308,28 @@ def run_tick(store: ShadowStore, source: MetricsSource, machine_ids: Sequence[st
     is actually due for re-evaluation -- Step 19's existing cadence logic,
     unmodified). See module docstring for why these are two separate paths.
 
-    No scaling call anywhere in this function or anything it calls -- still
-    logging only, per this stage's explicit boundary. A per-node failure
-    (a Prometheus error, a missing hybrid model, anything else) is caught,
-    logged, and does not stop the rest of the tick from running for other
-    nodes.
+    Through Step 25, no scaling call existed anywhere in this function --
+    logging only. Step 26 adds exactly one: if `cfg.enable_actuation` is
+    True (default False) AND this tick's machine is `cfg.actuation_machine_id`
+    AND `observe_node_once` produced a decision, the recommended replica
+    count is applied for real via `actuator.set_replicas` -- see that
+    module and `LiveLoopConfig`'s own comments. Every other node, and every
+    node when actuation is disabled, is unaffected: still observe and log
+    only. A per-node failure anywhere in this function (a Prometheus error,
+    a missing hybrid model, a failed actuation call, anything else) is
+    caught, logged, and does not stop the rest of the tick from running for
+    other nodes -- actuation failures are handled with exactly the same
+    "log it, move on" convention as every other real-infrastructure call
+    this project makes.
 
     Returns a summary dict of machine_ids grouped by outcome, useful for
     tests and for a caller that wants to log/inspect a tick's shape without
     re-deriving it from individual log calls.
     """
-    summary = {"observed": [], "skipped": [], "shadow_evaluated": [], "shadow_skipped": []}
+    summary = {
+        "observed": [], "skipped": [], "shadow_evaluated": [], "shadow_skipped": [],
+        "actuated": [], "actuation_skipped": [],
+    }
 
     for machine_id in machine_ids:
         try:
@@ -304,6 +338,21 @@ def run_tick(store: ShadowStore, source: MetricsSource, machine_ids: Sequence[st
             logger.exception("live_loop: ARIMA observation failed for machine=%s", machine_id)
             decision = None
         summary["observed" if decision is not None else "skipped"].append(machine_id)
+
+        if cfg.enable_actuation and decision is not None and machine_id == cfg.actuation_machine_id:
+            from . import actuator  # lazy import -- see module docstring
+            try:
+                actuator.set_replicas(
+                    cfg.actuation_deployment, cfg.actuation_namespace,
+                    decision["recommended_servers"],
+                )
+                summary["actuated"].append(machine_id)
+            except actuator.ActuationError as e:
+                logger.warning("live_loop: %s -- actuation skipped this tick", e)
+                summary["actuation_skipped"].append(machine_id)
+            except Exception:
+                logger.exception("live_loop: actuation failed for machine=%s", machine_id)
+                summary["actuation_skipped"].append(machine_id)
 
         state = store.load_state(machine_id)
         if state.current_forecaster != "hybrid":

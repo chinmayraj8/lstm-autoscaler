@@ -74,9 +74,15 @@ spec:
       labels:
         app: lstm-autoscaler-observer
     spec:
+      # Step 26: needed only for real actuation (get/patch on
+      # deployments/scale, nothing else -- see k8s/actuation-rbac.yaml,
+      # which must be applied for this ServiceAccount to actually exist).
+      # Harmless to leave set even with actuation disabled -- an unused
+      # ServiceAccount grants nothing by itself if actuation never fires.
+      serviceAccountName: lstm-autoscaler-observer
       containers:
         - name: observer
-          image: localhost:5000/lstm-autoscaler-observer:step25
+          image: localhost:5000/lstm-autoscaler-observer:step26
           # CORRECTION: Docker Desktop's Kubernetes does NOT actually share
           # `docker build`'s image store with the cluster -- kubelet reads
           # images from containerd's `k8s.io` namespace, while `docker
@@ -146,6 +152,44 @@ spec:
             # 24h-window methodology again (LiveLoopConfig's code
             # defaults). Do not re-add these as small values outside of a
             # similarly explicit, flagged, temporary demo.
+            #
+            # Step 26 -- real actuation. ENABLED below, targeting
+            # 172.18.0.3. NOTE: 172.18.0.2 was the original choice, but two
+            # consecutive live ticks (2026-09-04 08:26 and 08:31) logged
+            # observed decisions for 172.18.0.3 and 172.18.0.5 only --
+            # nothing at all for 172.18.0.2, not even a failure line. Root
+            # cause: resolve_tracked_machine_ids() re-discovers live nodes
+            # from Prometheus every tick (PrometheusMetricsSource.
+            # list_machine_ids) rather than trusting a fixed list, so a
+            # machine_id can exist historically in shadow_state.db's
+            # machines table (from a past tick) without being a currently
+            # live Prometheus target. 172.18.0.2 is most likely a stale
+            # node-exporter instance IP from an earlier Docker Desktop
+            # Kubernetes network state -- Docker Desktop can reassign node
+            # IPs across restarts -- and simply isn't scraped any more, so
+            # it never enters machine_ids and the actuation branch (which
+            # only ever runs for a machine_id actually present in that
+            # tick's loop) never triggers for it. This is the live-discovery
+            # design working as intended, not a bug in it: a hardcoded
+            # tracked-node list would have masked this instead of surfacing
+            # it. 172.18.0.3 and 172.18.0.5 are both confirmed live across
+            # multiple ticks; 172.18.0.3 is the one now wired for real
+            # actuation. This is an explicit, deliberate opt-in -- every
+            # deployment through Step 25 left LSTM_AUTOSCALER_ENABLE_ACTUATION
+            # unset (main.py's default of False), so actuation never fired.
+            # Requires k8s/actuation-rbac.yaml and k8s/demo-workload.yaml to
+            # already be applied (ServiceAccount/Role/RoleBinding for
+            # deployments/scale, and the demo-workload Deployment being
+            # scaled). To go back to observe-only, delete these two env
+            # vars (or set LSTM_AUTOSCALER_ENABLE_ACTUATION back to "0"/
+            # unset) and re-apply.
+            - name: LSTM_AUTOSCALER_ENABLE_ACTUATION
+              value: "1"
+            - name: LSTM_AUTOSCALER_ACTUATION_MACHINE_ID
+              value: "172.18.0.3"
+            # LSTM_AUTOSCALER_ACTUATION_DEPLOYMENT / _NAMESPACE are left at
+            # their defaults (demo-workload / lstm-autoscaler) and don't
+            # need setting unless you rename k8s/demo-workload.yaml's target.
           volumeMounts:
             - name: shadow-state
               mountPath: /data

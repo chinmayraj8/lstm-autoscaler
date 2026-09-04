@@ -1,0 +1,46 @@
+# Step 26: least-privilege RBAC for real Kubernetes actuation.
+#
+# Grants exactly one thing: get/patch on the `deployments/scale`
+# subresource, in the `lstm-autoscaler` namespace only. NOT cluster-admin,
+# NOT access to any other resource kind (pods, secrets, configmaps,
+# nodes, ...), NOT access to any other namespace. This ServiceAccount
+# cannot list secrets, cannot read other workloads' specs, cannot touch
+# anything outside what actuator.py actually calls
+# (read_namespaced_deployment_scale / patch_namespaced_deployment_scale).
+#
+# Applying this file does not, by itself, enable actuation -- that's still
+# gated behind LSTM_AUTOSCALER_ENABLE_ACTUATION in k8s/observer.yaml
+# (default unset/off). This just grants the PERMISSION so that when
+# actuation is deliberately turned on, the call has somewhere to succeed;
+# without this applied, an enabled actuation call would fail with a 403,
+# not silently do nothing.
+
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: lstm-autoscaler-observer
+  namespace: lstm-autoscaler
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: lstm-autoscaler-scale-only
+  namespace: lstm-autoscaler
+rules:
+  - apiGroups: ["apps"]
+    resources: ["deployments/scale"]
+    verbs: ["get", "patch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: lstm-autoscaler-observer-scale-only
+  namespace: lstm-autoscaler
+subjects:
+  - kind: ServiceAccount
+    name: lstm-autoscaler-observer
+    namespace: lstm-autoscaler
+roleRef:
+  kind: Role
+  name: lstm-autoscaler-scale-only
+  apiGroup: rbac.authorization.k8s.io

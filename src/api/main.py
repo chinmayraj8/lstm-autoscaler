@@ -228,10 +228,28 @@ async def lifespan(app: FastAPI):
         shadow_window_hours = float(
             os.environ.get("LSTM_AUTOSCALER_SHADOW_WINDOW_HOURS", _default_cfg.shadow_window_hours)
         )
+        # Step 26: real actuation, off by default. LSTM_AUTOSCALER_ENABLE_ACTUATION
+        # must be explicitly set truthy -- an unset or empty value (the default
+        # in every deployment through Step 25) leaves this byte-for-byte the
+        # observe-only behavior this project has had all along. See
+        # actuator.py and LiveLoopConfig's own comments for the RBAC/scope
+        # this assumes, and progress/2026-09-*-step26-*.md for why one named
+        # machine, not an aggregate, is what drives it.
+        enable_actuation = os.environ.get("LSTM_AUTOSCALER_ENABLE_ACTUATION", "").strip().lower() in {"1", "true", "yes"}
+        actuation_machine_id = os.environ.get("LSTM_AUTOSCALER_ACTUATION_MACHINE_ID", "").strip() or None
+        if enable_actuation and not actuation_machine_id:
+            raise ValueError(
+                "LSTM_AUTOSCALER_ENABLE_ACTUATION is set but "
+                "LSTM_AUTOSCALER_ACTUATION_MACHINE_ID is not -- refusing to start "
+                "with actuation enabled and no machine designated, rather than "
+                "silently actuating nothing or guessing which node."
+            )
         loop_cfg = LiveLoopConfig(
             tick_seconds=tick_seconds,
             shadow_fit_hours=shadow_fit_hours,
             shadow_window_hours=shadow_window_hours,
+            enable_actuation=enable_actuation,
+            actuation_machine_id=actuation_machine_id,
         )
 
         def _get_tracked_ids():
@@ -245,8 +263,15 @@ async def lifespan(app: FastAPI):
             daemon=True, name="live-forecasting-loop",
         )
         live_loop_thread.start()
-        print(f"[startup] Live forecasting loop started against {_PROMETHEUS_URL} "
-              f"(tick={tick_seconds}s). Observe-only — no scaling call anywhere in this path.")
+        if enable_actuation:
+            print(f"[startup] Live forecasting loop started against {_PROMETHEUS_URL} "
+                  f"(tick={tick_seconds}s). ACTUATION ENABLED for machine="
+                  f"{actuation_machine_id!r} -> deployment={loop_cfg.actuation_deployment!r} "
+                  f"namespace={loop_cfg.actuation_namespace!r}. Every other tracked node "
+                  f"remains observe-only.")
+        else:
+            print(f"[startup] Live forecasting loop started against {_PROMETHEUS_URL} "
+                  f"(tick={tick_seconds}s). Observe-only — no scaling call anywhere in this path.")
 
     _live_loop_thread = live_loop_thread
 

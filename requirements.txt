@@ -21,3 +21,10 @@ scikit-learn==1.8.0
 statsmodels==0.14.6
 tensorflow==2.16.2
 requests==2.33.1
+# Step 26: the real Kubernetes actuation client (actuator.py) -- reads/
+# patches the `deployments/scale` subresource only, nothing else. Not
+# used at all unless LSTM_AUTOSCALER_ENABLE_ACTUATION is explicitly set;
+# still a real import-time dependency of live_loop.py's actuation branch,
+# so it ships in every build of this image, same reasoning as tensorflow
+# above.
+kubernetes==36.0.3

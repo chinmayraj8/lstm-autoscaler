@@ -1,0 +1,57 @@
+# Step 26: the demo target this project's real actuation call scales.
+#
+# Why a demo workload at all: the real signal this project forecasts
+# (node-level CPU from Prometheus/node-exporter) is not tied to any real
+# variable-load service in this cluster -- there's no actual application
+# whose replica count meaningfully "should" track node CPU the way a
+# request-driven service's would. Rather than force a misleading story
+# (pretending node CPU predicts THIS workload's real demand), this
+# manifest is a small, clearly-labeled, otherwise-inert target: its only
+# purpose is to have a real Deployment whose replica count really changes
+# when actuator.py calls the Kubernetes API, so the actuation MECHANISM
+# (decision engine -> real API call -> real replica count change) is
+# proven end-to-end against real infrastructure. It is not evidence that
+# the forecast is good for this workload, because this workload has no
+# real load of its own -- see k8s/observer.yaml's actuation env vars and
+# progress/2026-09-*-step26-*.md for the honest scope of what this does
+# and doesn't demonstrate.
+#
+# nginx:alpine, not a bespoke image: cheap, well-known, and `kubectl get
+# pods` visibly showing real nginx pods appear/terminate as replicas
+# is legible to anyone watching, without needing to explain a custom app.
+
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: demo-workload
+  namespace: lstm-autoscaler
+  labels:
+    app: demo-workload
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: demo-workload
+  template:
+    metadata:
+      labels:
+        app: demo-workload
+    spec:
+      containers:
+        - name: demo-workload
+          image: nginx:alpine
+          ports:
+            - containerPort: 80
+          resources:
+            requests:
+              cpu: 10m
+              memory: 32Mi
+            limits:
+              cpu: 50m
+              memory: 64Mi
+          readinessProbe:
+            httpGet:
+              path: /
+              port: 80
+            initialDelaySeconds: 2
+            periodSeconds: 5

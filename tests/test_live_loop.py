@@ -11,6 +11,7 @@ which does not exist (see live_loop.py's module docstring).
 
 import threading
 from datetime import datetime, timedelta
+from unittest.mock import patch
 
 import numpy as np
 import pytest
@@ -123,6 +124,66 @@ def test_run_tick_arima_only_nodes_never_touch_shadow_windows():
     assert store.get_full_window_history("m_a") == []
     assert store.get_full_window_history("m_b") == []
     assert len(store.get_observed_decisions("m_a")) == 1
+
+
+# ── run_tick: real actuation (Step 26), off by default ──────────────────────
+
+def test_run_tick_actuation_disabled_by_default_never_calls_actuator():
+    source = StaticMetricsSource({
+        "m_a": synthetic_readings_series(T0, n_points=60, cadence_minutes=5, seed=1),
+    })
+    store = ShadowStore(":memory:")
+    now = T0 + timedelta(hours=3)
+    cfg = LiveLoopConfig(fit_lookback_hours=2.0)  # enable_actuation defaults to False
+
+    with patch("src.autoscaler.actuator.set_replicas") as fake_set_replicas:
+        summary = run_tick(store, source, ["m_a"], now, cfg)
+
+    fake_set_replicas.assert_not_called()
+    assert summary["actuated"] == []
+    assert summary["actuation_skipped"] == []
+
+
+def test_run_tick_actuation_enabled_calls_actuator_only_for_the_designated_machine():
+    source = StaticMetricsSource({
+        "m_a": synthetic_readings_series(T0, n_points=60, cadence_minutes=5, seed=1),
+        "m_b": synthetic_readings_series(T0, n_points=60, cadence_minutes=5, seed=2),
+    })
+    store = ShadowStore(":memory:")
+    now = T0 + timedelta(hours=3)
+    cfg = LiveLoopConfig(
+        fit_lookback_hours=2.0, enable_actuation=True, actuation_machine_id="m_a",
+        actuation_deployment="demo-workload", actuation_namespace="lstm-autoscaler",
+    )
+
+    with patch("src.autoscaler.actuator.set_replicas") as fake_set_replicas:
+        summary = run_tick(store, source, ["m_a", "m_b"], now, cfg)
+
+    assert summary["actuated"] == ["m_a"]
+    assert summary["actuation_skipped"] == []
+    fake_set_replicas.assert_called_once()
+    call_args = fake_set_replicas.call_args[0]
+    assert call_args[0] == "demo-workload"
+    assert call_args[1] == "lstm-autoscaler"
+    expected_replicas = store.get_observed_decisions("m_a")[0]["recommended_servers"]
+    assert call_args[2] == expected_replicas
+
+
+def test_run_tick_actuation_failure_is_caught_and_logged_not_crashed():
+    source = StaticMetricsSource({
+        "m_a": synthetic_readings_series(T0, n_points=60, cadence_minutes=5, seed=1),
+    })
+    store = ShadowStore(":memory:")
+    now = T0 + timedelta(hours=3)
+    cfg = LiveLoopConfig(fit_lookback_hours=2.0, enable_actuation=True, actuation_machine_id="m_a")
+
+    from src.autoscaler.actuator import ActuationError
+    with patch("src.autoscaler.actuator.set_replicas", side_effect=ActuationError("boom")):
+        summary = run_tick(store, source, ["m_a"], now, cfg)  # must not raise
+
+    assert summary["actuated"] == []
+    assert summary["actuation_skipped"] == ["m_a"]
+    assert summary["observed"] == ["m_a"]  # the rest of the tick still ran
 
 
 def test_run_tick_hybrid_assigned_node_without_model_is_skipped_not_crashed():
