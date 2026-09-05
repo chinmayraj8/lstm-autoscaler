@@ -185,6 +185,21 @@ happens on the next push.
 | Live cluster CPU signal | Flat/idle (nothing to forecast) | Real, bounded, randomized synthetic load (not a repeating waveform) |
 | Training data sufficiency check | N/A | `InsufficientRealHistory`, checked before any TensorFlow import |
 
+## Real-cluster verification
+
+Applied `k8s/load-generator.yaml` on the real Docker Desktop cluster
+(single node, so one `cpu-load-generator` pod total). Confirmed via
+`kubectl get pods` and `kubectl logs -f`:
+
+    cpu-load-generator: starting the randomized ramp cycle on cpu-load-generator-wrvwf
+    cpu-load-generator: 2026-09-05T07:48:59Z load=18% for 1109s
+    stress-ng: info:  [23] dispatching hogs: 1 cpu
+
+`load=18%` (base 10% + jitter) and `1109s` (inside the randomized
+600-1200s window) confirm the `/dev/urandom`-based jitter logic verified
+locally earlier is actually running correctly on the real cluster, not
+just in the sandbox dry-run. Real history is now accumulating.
+
 ## Still open
 
 - **The real multi-day run itself.** Nothing above has touched the real
