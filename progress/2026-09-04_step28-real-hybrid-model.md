@@ -200,6 +200,60 @@ Applied `k8s/load-generator.yaml` on the real Docker Desktop cluster
 locally earlier is actually running correctly on the real cluster, not
 just in the sandbox dry-run. Real history is now accumulating.
 
+## Real training run -- completed
+
+Fixed a real bug found the first time this was actually run:
+`scripts/train_real_hybrid_model.py`'s `sys.path.insert` only went up one
+directory (to `scripts/` itself) instead of two (to the repo root), so
+`from src.autoscaler...` failed with `ModuleNotFoundError`. `scripts/`
+sits at the same depth as `experiments/` under the repo root, which
+already uses the correct two-`dirname` pattern -- this script now matches
+it. Fixed and committed (`dde0833`).
+
+After a real macOS restart (which reset the `kubectl port-forward`, an
+expected and harmless gap), and reconnecting via the same command, the
+training run itself completed successfully against a genuinely
+gap-free 24-hour real Prometheus window for `172.18.0.3` (100% coverage,
+confirmed via a direct `/api/v1/query_range` check before training --
+see below):
+
+    n_train_points     = 289
+    n_sequences        = 281
+    epochs_trained     = 46
+    final_train_loss   = 0.000401
+    train_residual_std = 0.052965
+    training wall time = 4.3s (GPU-accelerated via tensorflow-metal)
+    saved to           = models/hybrid_residual/172.18.0.3.keras
+
+### Getting a genuinely clean window took real, honest troubleshooting
+
+Worth recording plainly, since it's a real part of this step, not just the
+happy path: getting to a gap-free 24h window took several rounds of real
+diagnosis, not a straight wait-and-check.
+
+- Pod `AGE` (calendar time since creation) is NOT the same thing as "hours
+  of real data collected" -- it does not pause during sleep, so relying on
+  it alone overstates real coverage whenever the Mac has slept.
+- Directly querying Prometheus's `/api/v1/query_range` for the same
+  metric the training pipeline uses, and comparing point count to the
+  window's clock-time span, gives the real, honest coverage number instead.
+- An initial overnight run showed only ~48-56% coverage even in windows
+  believed to be "up the whole time." Root-caused with real evidence
+  (`pmset -g log`, corrected after an initial too-broad grep pattern
+  accidentally matched assertion bookkeeping instead of real state
+  transitions): a closed lid combined with running on battery triggers
+  repeated short "Maintenance Sleep" / Power Nap cycles that `caffeinate`
+  cannot override, each one briefly pausing Docker Desktop's VM and
+  Prometheus scraping. Not a pipeline bug -- a real macOS power-management
+  interaction.
+- Fix: plugged in + lid genuinely open (or external display) for a full
+  24h stretch. Verified clean (100% coverage, 288/288 points) before
+  training, rather than assumed.
+- A subsequent macOS restart (to apply other changes) reset the
+  `kubectl port-forward` process, producing a `ConnectionRefusedError` on
+  the next training attempt -- expected, not a bug; fixed by simply
+  restarting the port-forward.
+
 ## Still open
 
 - **The real multi-day run itself.** Nothing above has touched the real
