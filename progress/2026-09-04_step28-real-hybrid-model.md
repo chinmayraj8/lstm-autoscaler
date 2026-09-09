@@ -354,3 +354,17 @@ a day. This matches Chinmay's own estimate discussed before this doc was
 updated. Not yet run for real (deliberately -- the guard above currently
 refuses it); `scripts/bootstrap_shadow_window.py --dry-run` is safe to run
 any time to sanity-check the pipeline without submitting anything.
+
+## Second real node trained: 172.18.0.5
+
+Same pipeline, same clean data window, run against the other live node
+(Sept 9): 289 real points, 11 epochs, final train loss 0.000966,
+train_residual_std 0.068184, wall time 1.7s. Saved to
+`models/hybrid_residual/172.18.0.5.keras` and copied into the observer
+pod's PVC alongside `172.18.0.3.keras` (both real, trained models now
+present). Both nodes are subject to the same leakage guard and the same
+~30h-then-daily cadence in `bootstrap_shadow_window.py` -- this doesn't
+shorten the wait for either one, but it does mean the eventual real
+promotion result (if it happens) generalizes across 2 real nodes, not 1,
+directly answering this project's own "not just a single dataset/node"
+bar for what counts as real.
