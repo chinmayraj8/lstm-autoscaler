@@ -44,7 +44,7 @@ import sys
 import time
 from datetime import datetime, timezone
 
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from src.autoscaler.metrics_source import DEFAULT_PROMETHEUS_URL, PrometheusMetricsSource  # noqa: E402
 from src.autoscaler.train_hybrid import InsufficientRealHistory, train_residual_hybrid_model  # noqa: E402
 
