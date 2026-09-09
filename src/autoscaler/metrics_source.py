@@ -44,6 +44,7 @@ for why it's built on `/api/v1/query` (instant queries), not
 implies. See progress/2026-09-03_step21-prometheus-metrics-source.md.
 """
 
+import time
 from abc import ABC, abstractmethod
 from datetime import datetime, timedelta
 from typing import List, Optional
@@ -155,6 +156,13 @@ DEFAULT_PROMETHEUS_URL = "http://kube-prometheus-stack-prometheus.monitoring.svc
 DEFAULT_RANGE_VECTOR = "5m"
 CPU_IDLE_MODE_LABEL = "idle"
 
+# Retry/backoff for a single _query_instant call (Step 22's own "still
+# open" list: "No retry/backoff on a transient Prometheus failure within a
+# tick"). See _query_instant's docstring for exactly what counts as
+# transient and why a real error is never retried.
+DEFAULT_MAX_RETRIES = 3
+DEFAULT_RETRY_BACKOFF_SECONDS = 1.0
+
 
 def build_cpu_util_query(range_vector: str = DEFAULT_RANGE_VECTOR,
                          idle_mode_label: str = CPU_IDLE_MODE_LABEL) -> str:
@@ -223,7 +231,9 @@ class PrometheusMetricsSource(MetricsSource):
                 idle_mode_label: str = CPU_IDLE_MODE_LABEL,
                 query_step_minutes: int = 5,
                 timeout_seconds: float = 10.0,
-                session: Optional[requests.Session] = None):
+                session: Optional[requests.Session] = None,
+                max_retries: int = DEFAULT_MAX_RETRIES,
+                retry_backoff_seconds: float = DEFAULT_RETRY_BACKOFF_SECONDS):
         self.prometheus_url = prometheus_url.rstrip("/")
         self.range_vector = range_vector
         self.idle_mode_label = idle_mode_label
@@ -231,6 +241,8 @@ class PrometheusMetricsSource(MetricsSource):
         self.query_step_minutes = query_step_minutes
         self.timeout_seconds = timeout_seconds
         self._session = session or requests.Session()
+        self.max_retries = max_retries
+        self.retry_backoff_seconds = retry_backoff_seconds
 
     def _query_instant(self, at: Optional[datetime] = None) -> List[dict]:
         """One `/api/v1/query` call. `at=None` means "now" (Prometheus's own
@@ -239,14 +251,43 @@ class PrometheusMetricsSource(MetricsSource):
         retention window, so a past `time=` still works for recent history,
         it isn't limited to "the current instant" despite the endpoint's name.
         Returns the raw `data.result` list of `{"metric": {...}, "value": [ts, "val"]}`.
+
+        Retries a TRANSIENT failure -- a connection error/timeout, or a 5xx
+        from Prometheus itself -- up to `self.max_retries` times with
+        exponential backoff (`self.retry_backoff_seconds * 2**attempt`
+        between attempts). Before this, a single blip on ANY ONE of
+        `fetch_readings`' potentially hundreds of calls for a long window
+        aborted the ENTIRE fetch, discarding every point already pulled,
+        recovering only on the next scheduled call (5+ minutes later for a
+        live tick) via a full re-fetch from scratch -- Step 22's own
+        documented "still open" gap. A real client error (4xx) or a
+        well-formed-but-wrong response (`PrometheusMetricsSourceError`,
+        raised below, after this retry loop) is NEVER retried -- both mean
+        "this query is wrong" or "Prometheus is confused", not "ask again
+        in a second," and retrying either would just mask a real bug
+        behind a delay instead of surfacing it.
         """
         params = {"query": self.query}
         if at is not None:
             params["time"] = at.timestamp()
-        resp = self._session.get(
-            f"{self.prometheus_url}/api/v1/query", params=params, timeout=self.timeout_seconds,
-        )
-        resp.raise_for_status()
+
+        resp = None
+        for attempt in range(self.max_retries + 1):
+            try:
+                resp = self._session.get(
+                    f"{self.prometheus_url}/api/v1/query", params=params, timeout=self.timeout_seconds,
+                )
+                resp.raise_for_status()
+                break
+            except requests.exceptions.HTTPError:
+                is_transient = resp is not None and 500 <= resp.status_code < 600
+                if not is_transient or attempt >= self.max_retries:
+                    raise
+            except (requests.exceptions.ConnectionError, requests.exceptions.Timeout):
+                if attempt >= self.max_retries:
+                    raise
+            time.sleep(self.retry_backoff_seconds * (2 ** attempt))
+
         payload = resp.json()
         if payload.get("status") != "success":
             raise PrometheusMetricsSourceError(f"Prometheus query failed: {payload}")

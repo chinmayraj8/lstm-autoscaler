@@ -17,11 +17,12 @@ No TensorFlow, no real dataset, no network. Two groups of tests:
 import json
 from datetime import datetime, timedelta
 from pathlib import Path
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 
 import numpy as np
 import pandas as pd
 import pytest
+import requests
 
 from src.autoscaler import config
 from src.autoscaler.data import _prepare_timeseries
@@ -254,3 +255,110 @@ def test_default_prometheus_url_matches_the_confirmed_in_cluster_target():
     assert source.prometheus_url == (
         "http://kube-prometheus-stack-prometheus.monitoring.svc.cluster.local:9090"
     )
+
+
+# ── _query_instant: retry/backoff on a transient failure ───────────────────
+# Step 22's own "still open" list: "No retry/backoff on a transient
+# Prometheus failure within a tick." All four tests below patch
+# time.sleep so a real multi-attempt backoff doesn't actually slow the
+# test suite down.
+
+def _error_response(status_code: int) -> MagicMock:
+    """A response whose `.raise_for_status()` raises a real
+    `requests.exceptions.HTTPError` carrying this status code, matching
+    what `requests` itself does -- not a bare exception, since
+    `_query_instant` inspects `response.status_code` off it to decide
+    whether the failure was transient."""
+    resp = MagicMock()
+    resp.status_code = status_code
+    resp.raise_for_status.side_effect = requests.exceptions.HTTPError(response=resp)
+    return resp
+
+
+def _ok_response(payload: dict) -> MagicMock:
+    resp = MagicMock()
+    resp.raise_for_status.return_value = None
+    resp.json.return_value = payload
+    return resp
+
+
+def test_query_instant_retries_a_connection_error_then_succeeds():
+    session = MagicMock()
+    session.get.side_effect = [requests.exceptions.ConnectionError("refused"), _ok_response(_load_fixture())]
+    source = PrometheusMetricsSource(session=session, max_retries=3, retry_backoff_seconds=1.0)
+
+    with patch("src.autoscaler.metrics_source.time.sleep") as fake_sleep:
+        result = source._query_instant(T0)
+
+    assert len(result) > 0  # the fixture's real result came through on the 2nd attempt
+    assert session.get.call_count == 2
+    fake_sleep.assert_called_once_with(1.0)  # backoff_seconds * 2**0
+
+
+def test_query_instant_retries_a_5xx_http_error_then_succeeds():
+    session = MagicMock()
+    session.get.side_effect = [_error_response(503), _ok_response(_load_fixture())]
+    source = PrometheusMetricsSource(session=session, max_retries=3)
+
+    with patch("src.autoscaler.metrics_source.time.sleep"):
+        result = source._query_instant(T0)
+
+    assert len(result) > 0
+    assert session.get.call_count == 2
+
+
+def test_query_instant_does_not_retry_a_4xx_http_error():
+    session = MagicMock()
+    session.get.side_effect = [_error_response(404)]  # a single item -- a retry would raise StopIteration
+    source = PrometheusMetricsSource(session=session, max_retries=3)
+
+    with patch("src.autoscaler.metrics_source.time.sleep") as fake_sleep:
+        with pytest.raises(requests.exceptions.HTTPError):
+            source._query_instant(T0)
+
+    assert session.get.call_count == 1
+    fake_sleep.assert_not_called()
+
+
+def test_query_instant_does_not_retry_a_well_formed_error_payload():
+    # status: "error" is a valid HTTP 200 response Prometheus itself sent
+    # back -- "this query is wrong," not a transient blip -- so this must
+    # raise PrometheusMetricsSourceError from the FIRST attempt, same as
+    # before this change (see test_fetch_readings_raises_on_non_success_status).
+    session = _mock_session({"status": "error", "error": "bad query"})
+    source = PrometheusMetricsSource(session=session, max_retries=3)
+
+    with patch("src.autoscaler.metrics_source.time.sleep") as fake_sleep:
+        with pytest.raises(PrometheusMetricsSourceError):
+            source._query_instant(T0)
+
+    assert session.get.call_count == 1
+    fake_sleep.assert_not_called()
+
+
+def test_query_instant_exhausts_retries_and_raises_the_real_exception():
+    session = MagicMock()
+    session.get.side_effect = requests.exceptions.ConnectionError("refused")  # every call fails
+    source = PrometheusMetricsSource(session=session, max_retries=2, retry_backoff_seconds=0.5)
+
+    with patch("src.autoscaler.metrics_source.time.sleep") as fake_sleep:
+        with pytest.raises(requests.exceptions.ConnectionError):
+            source._query_instant(T0)
+
+    assert session.get.call_count == 3  # the original attempt + 2 retries
+    assert fake_sleep.call_args_list == [((0.5,),), ((1.0,),)]  # 0.5*2**0, 0.5*2**1 -- no sleep after the last, fatal attempt
+
+
+def test_query_instant_backoff_is_exponential_across_multiple_retries():
+    session = MagicMock()
+    session.get.side_effect = [
+        requests.exceptions.ConnectionError("refused"),
+        requests.exceptions.ConnectionError("refused"),
+        _ok_response(_load_fixture()),
+    ]
+    source = PrometheusMetricsSource(session=session, max_retries=3, retry_backoff_seconds=2.0)
+
+    with patch("src.autoscaler.metrics_source.time.sleep") as fake_sleep:
+        source._query_instant(T0)
+
+    assert fake_sleep.call_args_list == [((2.0,),), ((4.0,),)]  # 2*2**0, 2*2**1
