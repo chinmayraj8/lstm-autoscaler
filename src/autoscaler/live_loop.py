@@ -141,6 +141,42 @@ class LiveLoopConfig:
     actuation_deployment: str = DEFAULT_ACTUATION_DEPLOYMENT
     actuation_namespace: str = DEFAULT_ACTUATION_NAMESPACE
 
+    # Step 26 follow-up -- circuit breaker beyond the decision engine's own
+    # +/-1-replica-per-tick step cap (that step's own "still open" list:
+    # "no rate-limit beyond what the decision engine's own scale_step
+    # already provides... worth revisiting if this ever points at
+    # something real"). Without this, a real, persistent problem (RBAC
+    # revoked, the deployment deleted, a real cluster outage) means
+    # run_tick calls the Kubernetes API and fails EVERY tick forever,
+    # indefinitely -- logged each time, but never backing off.
+    # `actuation_circuit_breaker_threshold` consecutive real failures trips
+    # it: real actuation attempts stop entirely for
+    # `actuation_circuit_breaker_cooldown`, then exactly one probe attempt
+    # is allowed -- success closes the breaker (resets the failure count),
+    # another failure re-opens it for a fresh cooldown window. `run_tick`'s
+    # OTHER work (observation, hybrid shadow-window scoring) is completely
+    # unaffected either way -- this only ever gates the real `set_replicas`
+    # call.
+    #
+    # Deliberately process-lifetime state, not persisted to `store` like
+    # `last_recommended_servers` is: a pod restart clearing the breaker and
+    # trying again is an acceptable, arguably correct reset point (many
+    # real circuit-breaker implementations reset on process restart too),
+    # and this project's own stated preference is "no new infra dependency
+    # unless asked" (see shadow_store.py's sqlite choice, Step 19) --
+    # nothing asked for cross-restart breaker persistence specifically.
+    # The two leading-underscore fields below are mutable RUNTIME STATE
+    # piggybacking on this otherwise-immutable-in-practice config object
+    # (the same object `run_scheduler_loop` reuses across every tick, by
+    # design -- see that function's docstring), not configuration; a test
+    # or caller that wants an isolated breaker just constructs a fresh
+    # `LiveLoopConfig`, exactly like every other test in this file already
+    # does.
+    actuation_circuit_breaker_threshold: int = 3
+    actuation_circuit_breaker_cooldown: timedelta = timedelta(hours=1)
+    _actuation_consecutive_failures: int = 0
+    _actuation_circuit_opened_at: Optional[datetime] = None
+
 
 # ── Path 1: always-on, single-forecaster observed decisions ─────────────────
 
@@ -297,6 +333,23 @@ def _build_hybrid_window(machine_id: str, source: MetricsSource, cfg: LiveLoopCo
 
 # ── One full tick ────────────────────────────────────────────────────────────
 
+def _record_actuation_failure(cfg: "LiveLoopConfig", machine_id: str, now: datetime) -> None:
+    """Shared by both `except` branches in run_tick's actuation block --
+    increments the consecutive-failure counter and (re)opens the circuit
+    breaker's cooldown window from THIS failure once the threshold is
+    reached, whether this is the failure that first trips it or a failed
+    post-cooldown probe extending an already-open breaker. See
+    LiveLoopConfig's own comment for the full design."""
+    cfg._actuation_consecutive_failures += 1
+    if cfg._actuation_consecutive_failures >= cfg.actuation_circuit_breaker_threshold:
+        cfg._actuation_circuit_opened_at = now
+        logger.warning(
+            "live_loop: actuation circuit breaker TRIPPED for machine=%s after %d consecutive "
+            "failures -- backing off real actuation attempts for %s",
+            machine_id, cfg._actuation_consecutive_failures, cfg.actuation_circuit_breaker_cooldown,
+        )
+
+
 def run_tick(store: ShadowStore, source: MetricsSource, machine_ids: Sequence[str], now: datetime,
             cfg: LiveLoopConfig = LiveLoopConfig(),
             model_loader: Callable = _load_hybrid_residual_model) -> dict:
@@ -341,65 +394,85 @@ def run_tick(store: ShadowStore, source: MetricsSource, machine_ids: Sequence[st
 
         if cfg.enable_actuation and decision is not None and machine_id == cfg.actuation_machine_id:
             from . import actuator  # lazy import -- see module docstring
-            try:
-                recommended = decision["recommended_servers"]
 
-                # Read-before-write reconciliation (Step 26 follow-up): the
-                # real-cluster verification in that step found this write
-                # was always blind to the real deployment's actual replica
-                # count -- `recommended` above comes entirely from this
-                # loop's own internal ledger (`store.last_recommended_servers`,
-                # set by `observe_node_once`/`record_observed_decision`),
-                # which can drift from reality (a manual `kubectl scale`, a
-                # pod restart that lost state before Step 19's persistence,
-                # or simply the very first tick after actuation is enabled
-                # -- exactly what caused the real 2->5 single-tick jump this
-                # step's own progress doc documents). `get_current_replicas`
-                # failing here (no real cluster reachable, an RBAC problem,
-                # anything -- always `ActuationError`, see actuator.py) is
-                # treated as "couldn't verify" rather than a hard stop: fall
-                # back to the un-reconciled `recommended`, matching this
-                # function's existing per-tick "log it, move on" convention,
-                # rather than a new failure mode that blocks actuation
-                # entirely whenever a single read fails.
+            breaker_open = (
+                cfg._actuation_circuit_opened_at is not None
+                and now - cfg._actuation_circuit_opened_at < cfg.actuation_circuit_breaker_cooldown
+            )
+            if breaker_open:
+                cooldown_until = cfg._actuation_circuit_opened_at + cfg.actuation_circuit_breaker_cooldown
+                logger.warning(
+                    "live_loop: actuation circuit breaker OPEN for machine=%s (%d consecutive "
+                    "failures) -- skipping this tick's real call, next probe attempt after %s",
+                    machine_id, cfg._actuation_consecutive_failures, cooldown_until,
+                )
+                summary["actuation_skipped"].append(machine_id)
+            else:
                 try:
-                    real_current = actuator.get_current_replicas(
-                        cfg.actuation_deployment, cfg.actuation_namespace,
-                    )
+                    recommended = decision["recommended_servers"]
+
+                    # Read-before-write reconciliation (Step 26 follow-up): the
+                    # real-cluster verification in that step found this write
+                    # was always blind to the real deployment's actual replica
+                    # count -- `recommended` above comes entirely from this
+                    # loop's own internal ledger (`store.last_recommended_servers`,
+                    # set by `observe_node_once`/`record_observed_decision`),
+                    # which can drift from reality (a manual `kubectl scale`, a
+                    # pod restart that lost state before Step 19's persistence,
+                    # or simply the very first tick after actuation is enabled
+                    # -- exactly what caused the real 2->5 single-tick jump this
+                    # step's own progress doc documents). `get_current_replicas`
+                    # failing here (no real cluster reachable, an RBAC problem,
+                    # anything -- always `ActuationError`, see actuator.py) is
+                    # treated as "couldn't verify" rather than a hard stop: fall
+                    # back to the un-reconciled `recommended`, matching this
+                    # function's existing per-tick "log it, move on" convention,
+                    # rather than a new failure mode that blocks actuation
+                    # entirely whenever a single read fails.
+                    try:
+                        real_current = actuator.get_current_replicas(
+                            cfg.actuation_deployment, cfg.actuation_namespace,
+                        )
+                    except actuator.ActuationError as e:
+                        logger.warning(
+                            "live_loop: could not read the real replica count for machine=%s "
+                            "before actuating (%s) -- proceeding unreconciled with this tick's "
+                            "internally-tracked recommendation", machine_id, e,
+                        )
+                        real_current = None
+
+                    if real_current is not None and real_current != decision["current_servers"]:
+                        dec_cfg = DecisionConfig(under_prov_weight=cfg.under_prov_weight)
+                        _, recommended = _decide_scaling(real_current, decision["planned_load_pct"], dec_cfg)
+                        logger.warning(
+                            "live_loop: reconciling machine=%s -- internal ledger said current=%d "
+                            "but the real cluster reports %d replicas; recomputed recommended=%d "
+                            "(this tick's un-reconciled value was %d)",
+                            machine_id, decision["current_servers"], real_current,
+                            recommended, decision["recommended_servers"],
+                        )
+                        summary["reconciled"].append(machine_id)
+
+                    actuator.set_replicas(cfg.actuation_deployment, cfg.actuation_namespace, recommended)
+                    # Keep the ledger truthful to what was actually just applied
+                    # -- matters whether or not reconciliation changed anything
+                    # above, since `observe_node_once` already wrote this tick's
+                    # UN-reconciled `recommended_servers` into the same ledger
+                    # column earlier in this loop iteration.
+                    store.set_last_recommended_servers(machine_id, recommended)
+                    summary["actuated"].append(machine_id)
+                    # A real success closes the breaker outright, whether this
+                    # was ordinary operation or a post-cooldown probe attempt.
+                    cfg._actuation_consecutive_failures = 0
+                    cfg._actuation_circuit_opened_at = None
                 except actuator.ActuationError as e:
-                    logger.warning(
-                        "live_loop: could not read the real replica count for machine=%s "
-                        "before actuating (%s) -- proceeding unreconciled with this tick's "
-                        "internally-tracked recommendation", machine_id, e,
-                    )
-                    real_current = None
-
-                if real_current is not None and real_current != decision["current_servers"]:
-                    dec_cfg = DecisionConfig(under_prov_weight=cfg.under_prov_weight)
-                    _, recommended = _decide_scaling(real_current, decision["planned_load_pct"], dec_cfg)
-                    logger.warning(
-                        "live_loop: reconciling machine=%s -- internal ledger said current=%d "
-                        "but the real cluster reports %d replicas; recomputed recommended=%d "
-                        "(this tick's un-reconciled value was %d)",
-                        machine_id, decision["current_servers"], real_current,
-                        recommended, decision["recommended_servers"],
-                    )
-                    summary["reconciled"].append(machine_id)
-
-                actuator.set_replicas(cfg.actuation_deployment, cfg.actuation_namespace, recommended)
-                # Keep the ledger truthful to what was actually just applied
-                # -- matters whether or not reconciliation changed anything
-                # above, since `observe_node_once` already wrote this tick's
-                # UN-reconciled `recommended_servers` into the same ledger
-                # column earlier in this loop iteration.
-                store.set_last_recommended_servers(machine_id, recommended)
-                summary["actuated"].append(machine_id)
-            except actuator.ActuationError as e:
-                logger.warning("live_loop: %s -- actuation skipped this tick", e)
-                summary["actuation_skipped"].append(machine_id)
-            except Exception:
-                logger.exception("live_loop: actuation failed for machine=%s", machine_id)
-                summary["actuation_skipped"].append(machine_id)
+                    logger.warning("live_loop: %s -- actuation skipped this tick", e)
+                    summary["actuation_skipped"].append(machine_id)
+                    _record_actuation_failure(cfg, machine_id, now)
+                except Exception:
+                    logger.exception("live_loop: actuation failed for machine=%s", machine_id)
+                    summary["actuation_skipped"].append(machine_id)
+                    _record_actuation_failure(cfg, machine_id, now)
 
         state = store.load_state(machine_id)
         if state.current_forecaster != "hybrid":

@@ -271,6 +271,109 @@ def test_run_tick_actuation_falls_back_when_reading_real_replicas_fails():
     assert fake_set.call_args[0][2] == un_reconciled
 
 
+
+# -- run_tick: actuation circuit breaker (Step 26 follow-up) ----------------
+# get_current_replicas is mocked to succeed (real_current == the ledger's
+# value) in every test below, so these isolate the breaker itself from the
+# reconciliation behavior already covered above.
+
+def test_run_tick_actuation_circuit_breaker_trips_after_threshold_and_then_skips():
+    source = StaticMetricsSource({
+        "m_a": synthetic_readings_series(T0, n_points=200, cadence_minutes=5, seed=1),
+    })
+    store = ShadowStore(":memory:")
+    cfg = LiveLoopConfig(
+        fit_lookback_hours=2.0, enable_actuation=True, actuation_machine_id="m_a",
+        actuation_circuit_breaker_threshold=2, actuation_circuit_breaker_cooldown=timedelta(hours=1),
+    )
+
+    from src.autoscaler.actuator import ActuationError
+    with patch("src.autoscaler.actuator.get_current_replicas", return_value=config.SIM_INITIAL_SERVERS):
+        with patch("src.autoscaler.actuator.set_replicas", side_effect=ActuationError("boom")) as fake_set:
+            # Two real, failed attempts -- the second crosses the threshold and trips it.
+            run_tick(store, source, ["m_a"], T0 + timedelta(hours=3), cfg)
+            run_tick(store, source, ["m_a"], T0 + timedelta(hours=3, minutes=5), cfg)
+            assert fake_set.call_count == 2
+        assert cfg._actuation_consecutive_failures == 2
+        assert cfg._actuation_circuit_opened_at is not None
+
+        # A third tick, still well inside the cooldown window: breaker is
+        # OPEN, so set_replicas must NOT be called again this tick.
+        with patch("src.autoscaler.actuator.set_replicas") as fake_set_during_cooldown:
+            summary = run_tick(store, source, ["m_a"], T0 + timedelta(hours=3, minutes=10), cfg)
+
+    fake_set_during_cooldown.assert_not_called()
+    assert summary["actuation_skipped"] == ["m_a"]
+    assert summary["actuated"] == []
+
+
+def test_run_tick_actuation_circuit_breaker_probes_after_cooldown_and_closes_on_success():
+    source = StaticMetricsSource({
+        "m_a": synthetic_readings_series(T0, n_points=1000, cadence_minutes=5, seed=1),
+    })
+    store = ShadowStore(":memory:")
+    cfg = LiveLoopConfig(
+        fit_lookback_hours=2.0, enable_actuation=True, actuation_machine_id="m_a",
+        actuation_circuit_breaker_threshold=1, actuation_circuit_breaker_cooldown=timedelta(hours=1),
+    )
+
+    from src.autoscaler.actuator import ActuationError
+    with patch("src.autoscaler.actuator.get_current_replicas", return_value=config.SIM_INITIAL_SERVERS):
+        with patch("src.autoscaler.actuator.set_replicas", side_effect=ActuationError("boom")):
+            run_tick(store, source, ["m_a"], T0 + timedelta(hours=3), cfg)  # 1 failure -> trips (threshold=1)
+        assert cfg._actuation_circuit_opened_at is not None
+
+        # Still well inside the cooldown: breaker open, no attempt.
+        with patch("src.autoscaler.actuator.set_replicas") as fake_set_during_cooldown:
+            run_tick(store, source, ["m_a"], T0 + timedelta(hours=3, minutes=10), cfg)
+        fake_set_during_cooldown.assert_not_called()
+
+        # Past the cooldown: exactly one probe attempt, and it succeeds.
+        with patch("src.autoscaler.actuator.set_replicas") as fake_set_probe:
+            summary = run_tick(store, source, ["m_a"], T0 + timedelta(hours=4, minutes=5), cfg)
+
+    fake_set_probe.assert_called_once()
+    assert summary["actuated"] == ["m_a"]
+    assert cfg._actuation_consecutive_failures == 0
+    assert cfg._actuation_circuit_opened_at is None  # breaker fully closed again
+
+
+def test_run_tick_actuation_circuit_breaker_open_does_not_skip_the_hybrid_shadow_path():
+    # Regression check: an earlier draft of this feature used `continue`
+    # to skip the rest of the per-machine loop body when the breaker was
+    # open, which silently also skipped the UNRELATED hybrid shadow-window
+    # path for the same machine on that tick -- these two paths must stay
+    # independent, per this module's own docstring. The breaker is forced
+    # open directly (white-box) rather than tripped via a real failing
+    # run_tick call first, so this test is decoupled from shadow.py's own
+    # reassignment logic (a real prior tick can legitimately revert m_a
+    # back to "arima" -- a different, already-covered behavior, not what
+    # this test is checking).
+    source = _source(n_hours=6, cadence_minutes=5, machine_id="m_a")
+    store = ShadowStore(":memory:")
+    _seed_hybrid_assignment(store, "m_a")
+    assert store.load_state("m_a").current_forecaster == "hybrid"
+
+    cfg = LiveLoopConfig(
+        fit_lookback_hours=1.0, shadow_fit_hours=1.0, shadow_window_hours=1.5,
+        enable_actuation=True, actuation_machine_id="m_a",
+        actuation_circuit_breaker_threshold=1, actuation_circuit_breaker_cooldown=timedelta(hours=1),
+    )
+    cfg._actuation_consecutive_failures = 1
+    cfg._actuation_circuit_opened_at = T0 + timedelta(hours=3)  # forced open
+
+    def _stub_loader(machine_id, model_dir):
+        return _StubResidualModel()
+
+    with patch("src.autoscaler.actuator.set_replicas") as fake_set:
+        summary = run_tick(store, source, ["m_a"], T0 + timedelta(hours=3, minutes=10), cfg,
+                           model_loader=_stub_loader)
+
+    fake_set.assert_not_called()  # breaker open -- confirms this tick exercised that branch
+    assert summary["actuation_skipped"] == ["m_a"]
+    # The hybrid path must still have run for m_a this tick, unaffected.
+    assert summary["shadow_evaluated"] == ["m_a"] or summary["shadow_skipped"] == ["m_a"]
+
 def test_run_tick_hybrid_assigned_node_without_model_is_skipped_not_crashed():
     source = _source(n_hours=6)
     store = ShadowStore(":memory:")
