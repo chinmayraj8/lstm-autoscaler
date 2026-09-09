@@ -287,3 +287,70 @@ Then, once enough real hours have accumulated, from a second terminal:
 And in a third:
 
     python3 scripts/train_real_hybrid_model.py --machine-id <live node id> --fit-hours 48
+
+## The gap after training: copying the .keras file into the PVC does not promote the node
+
+Confirmed by reading `live_loop.py`'s own module docstring and `run_tick`
+closely (not assumed): the hybrid shadow-window path only runs for a
+machine ALREADY on `current_forecaster == "hybrid"` --
+`if state.current_forecaster != "hybrid": continue`. This is a deliberate,
+pre-existing Step 22 design boundary, stated in that module's own words:
+the live loop "does not, and structurally cannot, promote an ARIMA node to
+hybrid on its own." Dropping the trained model into
+`/data/hybrid_residual/<machine_id>.keras` on the observer pod's PVC (done
+this step, real training run, see above) makes the file available to be
+loaded -- `_load_hybrid_residual_model` reads it fresh off disk with no
+caching -- but does not, by itself, get the node evaluated. The only real
+path to that first assignment is the Step 18/19 manual one:
+`POST /shadow/{machine_id}/window`, which needs to win
+`shadow.DEFAULT_MIN_WINDOWS = 3` consecutive real windows and clear a
+combined +/-1sigma statistical bar (`shadow.decide_assignment`).
+
+Two small fixes/additions made once this was understood:
+
+1. `scripts/train_real_hybrid_model.py`'s own printed "next step" text had
+   the wrong pod label in its suggested `kubectl get pod` command
+   (`app=lstm-observer`) -- confirmed the real label from `k8s/observer.yaml`
+   is `app=lstm-autoscaler-observer` (this cost a real failed `kubectl cp`
+   during the actual training run: `array index out of bounds: index 0,
+   length 0`). Fixed in the script itself, not just relayed as a one-off
+   correction.
+
+2. `scripts/bootstrap_shadow_window.py` (new): builds one real shadow
+   window from live Prometheus history and POSTs it to
+   `/shadow/{machine_id}/window`. Deliberately reuses, rather than
+   reimplements, the exact same real-data pipeline
+   `live_loop._build_hybrid_window` already runs internally
+   (`arima_baseline._arima_rolling_forecast` for the real ARIMA
+   walk-forward forecast, the trained LSTM's real residual prediction for
+   the hybrid forecast, `arima_baseline._inv_flat` for inverse-scaling) --
+   it only differs from `_build_hybrid_window` in the last step, POSTing
+   the arrays to the observer's real HTTP endpoint instead of calling
+   `shadow.run_shadow_window` in-process, because the pod's
+   `shadow_state.db` lives on its own PVC and isn't reachable any other
+   way from outside the cluster.
+
+   Added one real, enforced guard `_build_hybrid_window` itself has no
+   need for (the live loop only ever scores AFTER a node is already
+   hybrid-assigned, so this specific leakage window doesn't arise for it):
+   this script reads the trained model file's own mtime and refuses to
+   build a shadow window whose data (including the ARIMA-fit portion)
+   starts before the model was trained -- scoring the LSTM, even in shadow
+   mode, against data it may have already trained on would make the
+   comparison dishonest. Verified for real against the actual trained
+   `172.18.0.3.keras` (trained today): running the script immediately
+   correctly refused with a clear message, rather than silently producing
+   a leaky/inflated result. `--allow-overlap` exists as an explicit,
+   clearly-labeled escape hatch for a throwaway sanity check only -- the
+   script says so in its own output and never claims such a run counts
+   toward the real 3-window promotion.
+
+Real cadence this implies: the earliest valid (non-overlapping) first
+window is ~30h (`shadow_fit_hours` + `shadow_window_hours`) after the
+model's training cutoff, and each subsequent real window needs another
+~24h after that to stay independent -- so the real 3-window promotion, if
+it happens, is roughly a 3-4 day wait from today's training run, run once
+a day. This matches Chinmay's own estimate discussed before this doc was
+updated. Not yet run for real (deliberately -- the guard above currently
+refuses it); `scripts/bootstrap_shadow_window.py --dry-run` is safe to run
+any time to sanity-check the pipeline without submitting anything.

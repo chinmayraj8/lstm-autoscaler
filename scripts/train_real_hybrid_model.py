@@ -172,7 +172,7 @@ def main() -> int:
     print("Next step -- copy it into the observer pod's PVC so the running "
           "shadow-mode mechanism picks it up (adjust the pod name if it's different):")
     print()
-    print("    OBSERVER_POD=$(kubectl get pod -n lstm-autoscaler -l app=lstm-observer "
+    print("    OBSERVER_POD=$(kubectl get pod -n lstm-autoscaler -l app=lstm-autoscaler-observer "
           "-o jsonpath='{.items[0].metadata.name}')")
     print(f"    kubectl cp {result.model_path} "
           f"lstm-autoscaler/$OBSERVER_POD:/data/hybrid_residual/{args.machine_id}.keras")
