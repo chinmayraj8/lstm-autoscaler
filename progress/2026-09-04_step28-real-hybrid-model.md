@@ -368,3 +368,38 @@ shorten the wait for either one, but it does mean the eventual real
 promotion result (if it happens) generalizes across 2 real nodes, not 1,
 directly answering this project's own "not just a single dataset/node"
 bar for what counts as real.
+
+## PVC storage class and backup posture (verified, not just left unset)
+
+`observer.yaml`'s own comments flagged this as untested when the PVC was
+first added (Step 23): `storageClassName` deliberately left unset (uses
+the cluster's default), no backup/snapshot policy. Checked for real:
+
+    kubectl get pvc observer-shadow-state -n lstm-autoscaler \
+      -o jsonpath='{.spec.storageClassName}{"\n"}{.status.phase}{"\n"}'
+    -> standard
+    -> Bound
+
+`standard` is Docker Desktop's default StorageClass -- confirmed bound,
+not pending, matching what the pod's own successful restarts across this
+project (surviving a full macOS restart, per this same step's earlier
+"post-restart" section above) already implied in practice.
+
+Backup posture, decided deliberately rather than left as an oversight:
+none, and that's the right call at this project's scope. Docker Desktop's
+`standard` class is backed by the same single-node local Docker Desktop
+VM this entire cluster runs in -- it survives a pod reschedule or a
+normal macOS restart (both already exercised for real this step), but
+NOT a Docker Desktop reset/reinstall or the VM being deleted, since
+there's no real redundant storage backend behind it. Adding snapshot/
+backup tooling for a single-node local dev cluster whose actual content
+is one SQLite file (`shadow_state.db`) and two small `.keras` files would
+be meaningfully more infrastructure than this capstone's real Kubernetes
+actuation goal calls for, and there's no path from this cluster to
+production use where that risk would matter (see this project's own
+repeated note: the goal is genuinely real engineering for a portfolio,
+not an actual pilot deployment). If the underlying VM were ever lost, the
+real recovery path is exactly what this project already does by design:
+re-train (scripts/train_real_hybrid_model.py) and re-run the shadow-window
+bootstrap once enough fresh real data exists again -- not restore from a
+backup. Noted here as a deliberate scope decision, not a gap.
