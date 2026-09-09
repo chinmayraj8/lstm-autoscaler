@@ -69,6 +69,7 @@ from __future__ import annotations
 import argparse
 import os
 import sys
+from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -91,6 +92,33 @@ from src.autoscaler.metrics_source import DEFAULT_PROMETHEUS_URL, PrometheusMetr
 DEFAULT_MODEL_DIR = "models/hybrid_residual"
 DEFAULT_LOCAL_PROMETHEUS_URL = "http://localhost:9090"   # via port-forward, see module docstring
 DEFAULT_API_URL = "http://localhost:8000"                 # via port-forward, see module docstring
+
+
+@dataclass
+class LeakageGuardResult:
+    overlaps: bool   # True if this window's data would touch the model's own training data
+    refuse: bool     # True if main() should abort rather than proceed
+
+
+def check_training_data_overlap(fit_start: datetime, model_trained_at: datetime,
+                                allow_overlap: bool) -> LeakageGuardResult:
+    """Pure decision logic for the leakage guard -- split out from main()
+    so it's directly testable without a real model file, real Prometheus,
+    or CLI args (matching this project's test-fast convention: no
+    TensorFlow, no network needed to exercise this).
+
+    `fit_start` is the EARLIEST timestamp this window's data would use --
+    the ARIMA-fit portion (`shadow_fit_hours` before the window), not just
+    the window itself, since that portion is real data the LSTM's own
+    residual-hybrid forecast is evaluated against too. `model_trained_at`
+    is the trained model file's own mtime, treated as its real training
+    cutoff (see module docstring for why this is enforced rather than just
+    documented). `allow_overlap` is the script's own explicit,
+    loudly-labeled escape hatch for a throwaway sanity check -- overlap
+    still gets flagged (`overlaps=True`) even when allowed, so the caller
+    can label the result as not counting toward the real promotion."""
+    overlaps = fit_start < model_trained_at
+    return LeakageGuardResult(overlaps=overlaps, refuse=overlaps and not allow_overlap)
 
 
 def parse_args() -> argparse.Namespace:
@@ -155,7 +183,8 @@ def main() -> int:
 
     model_trained_at = datetime.fromtimestamp(os.path.getmtime(model_path), tz=timezone.utc)
     print(f"  model file mtime    = {model_trained_at.isoformat()} (treated as its training cutoff)")
-    if fit_start < model_trained_at and not args.allow_overlap:
+    guard = check_training_data_overlap(fit_start, model_trained_at, args.allow_overlap)
+    if guard.refuse:
         print()
         print("REFUSING: this window's data starts before the model's own training cutoff -- "
               "the LSTM would be scored (even in shadow mode) against data it may have already "
@@ -163,7 +192,7 @@ def main() -> int:
               "training cutoff above, or pass --allow-overlap for a throwaway sanity check only "
               "(will NOT count toward the real 3-window promotion).")
         return 3
-    overlap_flagged = fit_start < model_trained_at  # only reachable here if --allow-overlap was passed
+    overlap_flagged = guard.overlaps  # only reachable True here if --allow-overlap was passed
     if overlap_flagged:
         print()
         print("WARNING: --allow-overlap set and this window DOES overlap the model's training data. "
