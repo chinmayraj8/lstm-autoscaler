@@ -284,6 +284,27 @@ class ShadowStore:
             return default
         return int(row[0])
 
+    def set_last_recommended_servers(self, machine_id: str, value: int) -> None:
+        """Directly corrects the running 'shadow server count' ledger for
+        one node WITHOUT adding a new `observed_decisions` audit-log row --
+        used only by `live_loop.run_tick`'s real-actuation read-before-write
+        reconciliation (Step 26 follow-up) to keep this ledger truthful to
+        the real cluster's replica count after a successful
+        `actuator.set_replicas` call, even when that call's target ended up
+        differing from what `observe_node_once` originally computed this
+        tick (a real drift between this ledger and the live deployment --
+        see live_loop.py's module docstring on why that drift can happen).
+        `record_observed_decision` remains the only place that ever logs a
+        new observed-decision row; this method only ever touches the
+        mutable `machines.last_recommended_servers` pointer, same as that
+        method's own last statement does."""
+        with self._connect() as conn:
+            conn.execute("INSERT OR IGNORE INTO machines (machine_id) VALUES (?)", (machine_id,))
+            conn.execute(
+                "UPDATE machines SET last_recommended_servers = ? WHERE machine_id = ?",
+                (value, machine_id),
+            )
+
     def record_observed_decision(self, machine_id: str, observed_at: datetime, forecaster: str,
                                  forecast_cpu_pct: List[float], planned_load_pct: float,
                                  current_servers: int, recommended_servers: int, action: str) -> None:

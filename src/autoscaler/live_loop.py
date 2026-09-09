@@ -328,7 +328,7 @@ def run_tick(store: ShadowStore, source: MetricsSource, machine_ids: Sequence[st
     """
     summary = {
         "observed": [], "skipped": [], "shadow_evaluated": [], "shadow_skipped": [],
-        "actuated": [], "actuation_skipped": [],
+        "actuated": [], "actuation_skipped": [], "reconciled": [],
     }
 
     for machine_id in machine_ids:
@@ -342,10 +342,57 @@ def run_tick(store: ShadowStore, source: MetricsSource, machine_ids: Sequence[st
         if cfg.enable_actuation and decision is not None and machine_id == cfg.actuation_machine_id:
             from . import actuator  # lazy import -- see module docstring
             try:
-                actuator.set_replicas(
-                    cfg.actuation_deployment, cfg.actuation_namespace,
-                    decision["recommended_servers"],
-                )
+                recommended = decision["recommended_servers"]
+
+                # Read-before-write reconciliation (Step 26 follow-up): the
+                # real-cluster verification in that step found this write
+                # was always blind to the real deployment's actual replica
+                # count -- `recommended` above comes entirely from this
+                # loop's own internal ledger (`store.last_recommended_servers`,
+                # set by `observe_node_once`/`record_observed_decision`),
+                # which can drift from reality (a manual `kubectl scale`, a
+                # pod restart that lost state before Step 19's persistence,
+                # or simply the very first tick after actuation is enabled
+                # -- exactly what caused the real 2->5 single-tick jump this
+                # step's own progress doc documents). `get_current_replicas`
+                # failing here (no real cluster reachable, an RBAC problem,
+                # anything -- always `ActuationError`, see actuator.py) is
+                # treated as "couldn't verify" rather than a hard stop: fall
+                # back to the un-reconciled `recommended`, matching this
+                # function's existing per-tick "log it, move on" convention,
+                # rather than a new failure mode that blocks actuation
+                # entirely whenever a single read fails.
+                try:
+                    real_current = actuator.get_current_replicas(
+                        cfg.actuation_deployment, cfg.actuation_namespace,
+                    )
+                except actuator.ActuationError as e:
+                    logger.warning(
+                        "live_loop: could not read the real replica count for machine=%s "
+                        "before actuating (%s) -- proceeding unreconciled with this tick's "
+                        "internally-tracked recommendation", machine_id, e,
+                    )
+                    real_current = None
+
+                if real_current is not None and real_current != decision["current_servers"]:
+                    dec_cfg = DecisionConfig(under_prov_weight=cfg.under_prov_weight)
+                    _, recommended = _decide_scaling(real_current, decision["planned_load_pct"], dec_cfg)
+                    logger.warning(
+                        "live_loop: reconciling machine=%s -- internal ledger said current=%d "
+                        "but the real cluster reports %d replicas; recomputed recommended=%d "
+                        "(this tick's un-reconciled value was %d)",
+                        machine_id, decision["current_servers"], real_current,
+                        recommended, decision["recommended_servers"],
+                    )
+                    summary["reconciled"].append(machine_id)
+
+                actuator.set_replicas(cfg.actuation_deployment, cfg.actuation_namespace, recommended)
+                # Keep the ledger truthful to what was actually just applied
+                # -- matters whether or not reconciliation changed anything
+                # above, since `observe_node_once` already wrote this tick's
+                # UN-reconciled `recommended_servers` into the same ledger
+                # column earlier in this loop iteration.
+                store.set_last_recommended_servers(machine_id, recommended)
                 summary["actuated"].append(machine_id)
             except actuator.ActuationError as e:
                 logger.warning("live_loop: %s -- actuation skipped this tick", e)

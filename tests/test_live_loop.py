@@ -186,6 +186,91 @@ def test_run_tick_actuation_failure_is_caught_and_logged_not_crashed():
     assert summary["observed"] == ["m_a"]  # the rest of the tick still ran
 
 
+# ── run_tick: read-before-write reconciliation (Step 26 follow-up) ─────────
+# `get_current_replicas` is unmocked in the three tests above -- against
+# this test suite's real environment (no in-cluster token, no kubeconfig)
+# it genuinely raises ActuationError via `_load_config` (see
+# test_actuator.py), which the reconciliation code below treats as
+# "couldn't verify" and falls back on, unreconciled -- exactly reproducing
+# this loop's pre-reconciliation behavior. That fallback path is what kept
+# those three tests passing unmodified; the tests below cover the new
+# behavior explicitly, with `get_current_replicas` mocked.
+
+def test_run_tick_actuation_reconciles_when_real_replicas_disagree_with_the_ledger():
+    source = StaticMetricsSource({
+        "m_a": synthetic_readings_series(T0, n_points=60, cadence_minutes=5, seed=1),
+    })
+    store = ShadowStore(":memory:")
+    now = T0 + timedelta(hours=3)
+    cfg = LiveLoopConfig(
+        fit_lookback_hours=2.0, enable_actuation=True, actuation_machine_id="m_a",
+        actuation_deployment="demo-workload", actuation_namespace="lstm-autoscaler",
+    )
+
+    # A plausible in-bounds drift (still within [min_servers, max_servers])
+    # from the ledger's default `config.SIM_INITIAL_SERVERS` -- big enough
+    # that whatever `_decide_scaling` recomputes from it is guaranteed to
+    # differ from this tick's un-reconciled recommendation, but not so far
+    # outside [min_servers, max_servers] that the candidate-clamping in
+    # `_decide_scaling` itself (not this reconciliation code) produces a
+    # confusing edge case unrelated to what this test is checking.
+    real_replicas = config.DEC_MAX_SERVERS - 3
+    assert config.DEC_MIN_SERVERS < real_replicas < config.DEC_MAX_SERVERS
+    assert real_replicas != config.SIM_INITIAL_SERVERS
+
+    with patch("src.autoscaler.actuator.get_current_replicas", return_value=real_replicas) as fake_get,          patch("src.autoscaler.actuator.set_replicas") as fake_set:
+        summary = run_tick(store, source, ["m_a"], now, cfg)
+
+    fake_get.assert_called_once_with("demo-workload", "lstm-autoscaler")
+    assert summary["actuated"] == ["m_a"]
+    assert summary["reconciled"] == ["m_a"]
+
+    un_reconciled = store.get_observed_decisions("m_a")[0]["recommended_servers"]
+    actuated_value = fake_set.call_args[0][2]
+    assert actuated_value != un_reconciled  # the real count changed what got sent
+    # The scale step cap still applies to the RECONCILED base, not the stale one.
+    assert abs(actuated_value - real_replicas) <= config.DEC_SCALE_STEP
+    # The ledger is corrected to match what was actually just applied.
+    assert store.get_last_recommended_servers("m_a", default=-1) == actuated_value
+
+
+def test_run_tick_actuation_skips_reconciliation_when_real_replicas_already_match():
+    source = StaticMetricsSource({
+        "m_a": synthetic_readings_series(T0, n_points=60, cadence_minutes=5, seed=1),
+    })
+    store = ShadowStore(":memory:")
+    now = T0 + timedelta(hours=3)
+    cfg = LiveLoopConfig(
+        fit_lookback_hours=2.0, enable_actuation=True, actuation_machine_id="m_a",
+        actuation_deployment="demo-workload", actuation_namespace="lstm-autoscaler",
+    )
+
+    with patch("src.autoscaler.actuator.get_current_replicas", return_value=config.SIM_INITIAL_SERVERS),          patch("src.autoscaler.actuator.set_replicas") as fake_set:
+        summary = run_tick(store, source, ["m_a"], now, cfg)
+
+    assert summary["reconciled"] == []
+    un_reconciled = store.get_observed_decisions("m_a")[0]["recommended_servers"]
+    assert fake_set.call_args[0][2] == un_reconciled
+
+
+def test_run_tick_actuation_falls_back_when_reading_real_replicas_fails():
+    source = StaticMetricsSource({
+        "m_a": synthetic_readings_series(T0, n_points=60, cadence_minutes=5, seed=1),
+    })
+    store = ShadowStore(":memory:")
+    now = T0 + timedelta(hours=3)
+    cfg = LiveLoopConfig(fit_lookback_hours=2.0, enable_actuation=True, actuation_machine_id="m_a")
+
+    from src.autoscaler.actuator import ActuationError
+    with patch("src.autoscaler.actuator.get_current_replicas", side_effect=ActuationError("no cluster")),          patch("src.autoscaler.actuator.set_replicas") as fake_set:
+        summary = run_tick(store, source, ["m_a"], now, cfg)  # must not raise
+
+    assert summary["actuated"] == ["m_a"]
+    assert summary["reconciled"] == []
+    un_reconciled = store.get_observed_decisions("m_a")[0]["recommended_servers"]
+    assert fake_set.call_args[0][2] == un_reconciled
+
+
 def test_run_tick_hybrid_assigned_node_without_model_is_skipped_not_crashed():
     source = _source(n_hours=6)
     store = ShadowStore(":memory:")

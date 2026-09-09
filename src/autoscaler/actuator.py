@@ -53,13 +53,32 @@ def _load_config() -> None:
     """In-cluster config when running as a pod -- the real target for this
     module (k8s/observer.yaml's ServiceAccount). Falls back to the local
     kubeconfig only so this module is exercisable interactively/in a
-    real-cluster integration test run from outside the cluster; the unit
+    real-cluster integration test run from outside the cluster; most unit
     tests (tests/test_actuator.py) never reach this function at all --
-    they patch `kubernetes.client.AppsV1Api` directly."""
+    they patch it directly.
+
+    Both branches failing (no in-cluster token AND no usable kubeconfig --
+    e.g. a pod whose ServiceAccount token isn't mounted yet, or this
+    module exercised interactively with no kubeconfig present at all) used
+    to raise whatever raw exception `load_kube_config` happened to throw,
+    contradicting this module's own documented contract (get_current_replicas/
+    set_replicas: "never a raw kubernetes-client exception"). Wrapped in
+    `ActuationError` here so every caller -- including the new
+    read-before-write reconciliation in live_loop.run_tick, which treats
+    an `ActuationError` from `get_current_replicas` as "couldn't verify,
+    fall back gracefully" -- sees one consistent exception type."""
     try:
         k8s_config.load_incluster_config()
+        return
     except k8s_config.ConfigException:
+        pass
+    try:
         k8s_config.load_kube_config()
+    except Exception as e:
+        raise ActuationError(
+            f"could not load a Kubernetes client config (no in-cluster token, "
+            f"no usable kubeconfig): {e}"
+        ) from e
 
 
 def get_current_replicas(deployment: str, namespace: str) -> int:

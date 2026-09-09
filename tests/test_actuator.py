@@ -82,3 +82,20 @@ def test_load_config_falls_back_to_kube_config_outside_a_cluster():
             from src.autoscaler.actuator import _load_config
             _load_config()
             fake_kube_config.assert_called_once()
+
+
+def test_load_config_wraps_total_failure_in_actuation_error():
+    # Neither in-cluster config nor a local kubeconfig is reachable -- e.g.
+    # this module exercised interactively with nothing set up, or a pod
+    # whose ServiceAccount token isn't mounted yet. Must surface as
+    # ActuationError, never the raw exception `load_kube_config` throws --
+    # get_current_replicas/set_replicas's own docstrings promise this, and
+    # live_loop's read-before-write reconciliation relies on it to tell
+    # "couldn't verify, fall back gracefully" apart from a real bug.
+    from kubernetes.config import ConfigException
+
+    with patch("src.autoscaler.actuator.k8s_config.load_incluster_config", side_effect=ConfigException("no token")):
+        with patch("src.autoscaler.actuator.k8s_config.load_kube_config", side_effect=FileNotFoundError("no kubeconfig")):
+            from src.autoscaler.actuator import ActuationError, _load_config
+            with pytest.raises(ActuationError, match="could not load a Kubernetes client config"):
+                _load_config()
