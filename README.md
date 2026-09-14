@@ -91,6 +91,35 @@ kubectl port-forward svc/lstm-autoscaler-observer -n lstm-autoscaler 8000:80
 kubectl port-forward svc/kube-prometheus-stack-prometheus -n monitoring 9090:9090
 ```
 
+This dies the moment the terminal closes or the process exits for any
+reason, and has to be re-run by hand every time -- confirmed, repeatedly,
+to be the actual cause behind the frontend showing "Prometheus
+unreachable"/"live loop not running" when the observer itself was healthy
+the whole time. Neither `NodePort` nor `LoadBalancer` gets auto-published
+to `localhost` by Docker Desktop's Kubernetes on this machine (checked
+directly; see `k8s/observer.yaml`'s Service comment for what was tried),
+so the actual permanent fix (macOS only) is a LaunchAgent that keeps the
+observer's port-forward running indefinitely -- auto-starts at login,
+auto-restarts if it ever dies:
+
+```bash
+cp scripts/com.lstm-autoscaler.port-forward.plist ~/Library/LaunchAgents/
+launchctl load ~/Library/LaunchAgents/com.lstm-autoscaler.port-forward.plist
+```
+
+Uninstall with:
+
+```bash
+launchctl unload ~/Library/LaunchAgents/com.lstm-autoscaler.port-forward.plist
+rm ~/Library/LaunchAgents/com.lstm-autoscaler.port-forward.plist
+```
+
+The plist hardcodes this machine's `kubectl` path and `docker-desktop`
+context -- edit both if either ever changes. It only covers the observer;
+the Prometheus port-forward above is still a manual, one-off command
+(only needed for hitting Prometheus's own UI/API directly, not for the
+frontend or the observer itself).
+
 ### Frontend
 
 ```bash

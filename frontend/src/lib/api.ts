@@ -53,15 +53,26 @@ export function subscribeUnauthorized(listener: () => void): () => void {
  * thrown ApiError for those specific statuses. A 401 (missing/wrong
  * bearer token) is never treated as null -- it always throws, AND flips
  * `_unauthorized` so a wrong/missing token fails visibly instead of just
- * showing empty charts. */
+ * showing empty charts.
+ *
+ * `trackAuth` (default true) gates whether THIS call's status is allowed
+ * to touch the shared `_unauthorized` flag at all. /health is the one
+ * caller that passes `trackAuth: false` -- it's deliberately
+ * unauthenticated server-side (see main.py), so it always returns 200
+ * regardless of whether the token is valid. Without this exclusion, a
+ * /health poll settling AFTER a real 401 from a protected endpoint would
+ * flip `_unauthorized` back to false and hide an actual bad/missing
+ * token -- confirmed as a real bug, not hypothetical: the "NOT
+ * AUTHENTICATED" badge disappeared on screen while /machines, /config,
+ * and /shadow/* kept 401ing in the server's own logs the whole time. */
 async function getJson<T>(
   url: string,
   token: string,
-  opts: { treat404AsNull?: boolean; treat422AsNull?: boolean } = {},
+  opts: { treat404AsNull?: boolean; treat422AsNull?: boolean; trackAuth?: boolean } = {},
 ): Promise<T | null> {
   const headers: HeadersInit = token ? { Authorization: `Bearer ${token}` } : {}
   const res = await fetch(url, { headers })
-  _setUnauthorized(res.status === 401)
+  if (opts.trackAuth !== false) _setUnauthorized(res.status === 401)
   if (res.status === 404 && opts.treat404AsNull) return null
   if (res.status === 422 && opts.treat422AsNull) return null
   if (!res.ok) {
@@ -91,8 +102,10 @@ export function createApiClient(observerUrl: string, token: string) {
 
   return {
     // /health is deliberately unauthenticated server-side too (see
-    // main.py) but sending the header anyway is harmless.
-    health: () => getJson<HealthResponse>(`${base}/health`, token),
+    // main.py) but sending the header anyway is harmless. trackAuth:
+    // false so this call's always-200 response never masks a real 401
+    // from a protected endpoint (see getJson's own comment).
+    health: () => getJson<HealthResponse>(`${base}/health`, token, { trackAuth: false }),
 
     shadowStatus: (machineId: string) =>
       getJson<ShadowStatusResponse>(`${base}/shadow/${encodeURIComponent(machineId)}`, token, {

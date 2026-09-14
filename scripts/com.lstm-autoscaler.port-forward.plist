@@ -1,0 +1,67 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  macOS LaunchAgent: keeps `kubectl port-forward` to the observer Service
+  running permanently, so the frontend's default http://localhost:8000
+  always has something listening -- without a terminal window that has to
+  stay open, and without remembering to re-run the command by hand.
+
+  Why this exists: neither NodePort nor LoadBalancer gets auto-published
+  to localhost by Docker Desktop's Kubernetes on this machine (checked
+  directly -- `docker port desktop-worker`/`desktop-control-plane` only
+  forwards 6443, the API server; a LoadBalancer Service's EXTERNAL-IP
+  came back as another in-cluster IP, not `localhost`). A client-side
+  port-forward is therefore the only thing that actually works here --
+  this LaunchAgent is what makes THAT permanent instead of a command you
+  have to remember. See k8s/observer.yaml's Service comment for the full
+  story of what was tried and ruled out.
+
+  `KeepAlive` + `ThrottleInterval` make this self-healing: if
+  kubectl port-forward exits for any reason (Docker Desktop restarting,
+  the observer pod being replaced, a network blip, the Mac sleeping),
+  launchd restarts it automatically, retrying every 5s, indefinitely --
+  no manual intervention needed. `RunAtLoad` plus installing this in
+  ~/Library/LaunchAgents means it also comes back on its own after a
+  login/reboot.
+
+  `/opt/homebrew/bin/kubectl` and `--context docker-desktop` are
+  hardcoded to this specific machine's actual setup (Homebrew's Apple
+  Silicon install path; pinning the context means this job is unaffected
+  by whatever context any of your own terminal sessions happen to be
+  using) -- not meant to be portable to a different machine without
+  editing both to match.
+
+  Install (see README.md for the full instructions):
+    cp scripts/com.lstm-autoscaler.port-forward.plist ~/Library/LaunchAgents/
+    launchctl load ~/Library/LaunchAgents/com.lstm-autoscaler.port-forward.plist
+  Uninstall:
+    launchctl unload ~/Library/LaunchAgents/com.lstm-autoscaler.port-forward.plist
+    rm ~/Library/LaunchAgents/com.lstm-autoscaler.port-forward.plist
+-->
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.lstm-autoscaler.port-forward</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>/opt/homebrew/bin/kubectl</string>
+        <string>port-forward</string>
+        <string>--context</string>
+        <string>docker-desktop</string>
+        <string>-n</string>
+        <string>lstm-autoscaler</string>
+        <string>svc/lstm-autoscaler-observer</string>
+        <string>8000:80</string>
+    </array>
+    <key>RunAtLoad</key>
+    <true/>
+    <key>KeepAlive</key>
+    <true/>
+    <key>ThrottleInterval</key>
+    <integer>5</integer>
+    <key>StandardOutPath</key>
+    <string>/tmp/lstm-autoscaler-port-forward.log</string>
+    <key>StandardErrorPath</key>
+    <string>/tmp/lstm-autoscaler-port-forward.err.log</string>
+</dict>
+</plist>

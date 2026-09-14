@@ -353,6 +353,24 @@ spec:
         - name: tmp
           emptyDir: {}
 ---
+# ClusterIP -- not NodePort/LoadBalancer. Both were tried and empirically
+# ruled out as a way to give the browser-based frontend a stable address
+# without a `kubectl port-forward` process running: `docker port
+# desktop-worker`/`desktop-control-plane` shows Docker Desktop's
+# Kubernetes VM only forwards 6443 (the API server) to the Mac host --
+# NOT the NodePort range, and switching this Service to `type:
+# LoadBalancer` got an EXTERNAL-IP that was just another in-cluster IP,
+# not `localhost`, and was equally unreachable from the host. Neither
+# result matches what's sometimes documented for other
+# Docker-Desktop-Kubernetes versions/configurations -- verified against
+# THIS machine's actual behavior rather than assumed. The real fix for
+# host reachability is a macOS LaunchAgent that keeps a
+# `kubectl port-forward` alive permanently (auto-starts at login,
+# auto-restarts if it dies) -- see scripts/observer-port-forward.plist
+# and README.md. This Service stays ClusterIP because that's genuinely
+# all it needs to be: the LaunchAgent's port-forward and the
+# ServiceMonitor's in-cluster scrape both only ever need ClusterIP-level
+# reachability, nothing more.
 apiVersion: v1
 kind: Service
 metadata:

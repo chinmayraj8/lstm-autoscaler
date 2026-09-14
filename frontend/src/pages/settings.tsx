@@ -1,3 +1,5 @@
+import { Eye, EyeOff } from "lucide-react"
+import { useEffect, useState } from "react"
 import { Panel, PanelHeader, Section } from "@/components/section"
 import { Button } from "@/components/ui/button"
 import { Input } from "@/components/ui/input"
@@ -6,13 +8,59 @@ import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@
 import { Slider } from "@/components/ui/slider"
 import { Switch } from "@/components/ui/switch"
 import { useHealth, useMachines, useScalingConfig } from "@/hooks/queries"
+import { useApi } from "@/hooks/use-api"
+import { ApiError } from "@/lib/api"
 import { useSettings } from "@/lib/settings"
+
+type TokenStatus = "empty" | "checking" | "ok" | "rejected" | "unknown"
 
 export default function SettingsPage() {
   const { settings, setSettings, resetSettings } = useSettings()
   const machines = useMachines()
   const health = useHealth()
   const config = useScalingConfig()
+  const api = useApi()
+  const [showToken, setShowToken] = useState(false)
+  // "empty" is derived at render time below, never via setState -- it's
+  // knowable synchronously from settings.apiToken alone, no need to
+  // synchronize with anything external for that case. This state only
+  // ever holds the outcome of the actual async check.
+  const [checkResult, setCheckResult] = useState<Exclude<TokenStatus, "empty">>("checking")
+
+  // A plain, direct fetch via `api.scalingConfig()` -- deliberately NOT
+  // `useScalingConfig()`'s React Query state (tried that first; got it
+  // wrong). A query against a bad token can get stuck in TanStack Query's
+  // own "pending"/paused limbo and never actually settle to `isError` --
+  // the exact reason `_unauthorized` in api.ts already exists as an
+  // independent pub-sub rather than something read off `query.state`.
+  // This effect is that same pattern applied here: call the endpoint
+  // directly, read the real resolved/rejected outcome, done -- this is
+  // the check that would have caught a bad/garbage token immediately, at
+  // the point of typing it in, rather than only surfacing minutes later
+  // as a confusing "stale"/"unreachable" dashboard with no obvious cause
+  // (see incident this was added after: the token field had gotten a
+  // stray paste of unrelated text into it, which nothing on this page
+  // said out loud until the header's own "not authenticated" badge
+  // happened to catch it).
+  useEffect(() => {
+    if (settings.apiToken === "") return
+    setCheckResult("checking")
+    let cancelled = false
+    api
+      .scalingConfig()
+      .then(() => {
+        if (!cancelled) setCheckResult("ok")
+      })
+      .catch((e: unknown) => {
+        if (cancelled) return
+        setCheckResult(e instanceof ApiError && e.status === 401 ? "rejected" : "unknown")
+      })
+    return () => {
+      cancelled = true
+    }
+  }, [api, settings.apiToken])
+
+  const tokenStatus: TokenStatus = settings.apiToken === "" ? "empty" : checkResult
 
   return (
     <div className="max-w-2xl space-y-6">
@@ -41,20 +89,54 @@ export default function SettingsPage() {
 
           <div className="space-y-1.5">
             <Label htmlFor="api-token">API token</Label>
-            <Input
-              id="api-token"
-              type="password"
-              autoComplete="off"
-              value={settings.apiToken}
-              onChange={(e) => setSettings({ apiToken: e.target.value })}
-              className="font-mono text-sm"
-              placeholder="leave blank if the observer has no LSTM_AUTOSCALER_API_TOKEN set"
-            />
+            <div className="relative">
+              <Input
+                id="api-token"
+                type={showToken ? "text" : "password"}
+                autoComplete="off"
+                value={settings.apiToken}
+                onChange={(e) => setSettings({ apiToken: e.target.value })}
+                // Trimmed on BLUR, not on every keystroke -- trimming on
+                // change looked right but wasn't: since this is a
+                // controlled input, trimming on every change strips any
+                // space typed while it's still trailing, which is true of
+                // basically every space typed sequentially, silently
+                // mangling anything with spaces in it as you type it (a
+                // real paste is unaffected either way, since it fires one
+                // change with the whole string). Trimming once on blur
+                // still quietly absorbs a stray leading/trailing space or
+                // newline from a paste, without that side effect.
+                onBlur={(e) => setSettings({ apiToken: e.target.value.trim() })}
+                className="pr-8 font-mono text-sm"
+                placeholder="leave blank if the observer has no LSTM_AUTOSCALER_API_TOKEN set"
+              />
+              <button
+                type="button"
+                onClick={() => setShowToken((v) => !v)}
+                className="absolute inset-y-0 right-1.5 flex items-center text-muted-foreground hover:text-foreground"
+                aria-label={showToken ? "Hide token" : "Show token"}
+              >
+                {showToken ? <EyeOff className="h-3.5 w-3.5" /> : <Eye className="h-3.5 w-3.5" />}
+              </button>
+            </div>
             <p className="text-xs text-muted-foreground">
               Sent as <code className="font-mono">Authorization: Bearer &lt;token&gt;</code> on every request when
               set. Leave blank against an unauthenticated observer &mdash; no header is sent at all, rather than a
               blank one.
             </p>
+            {/* A masked password field looks identical whether it holds a
+                real 64-char hex token or several sentences of pasted
+                prose -- this is the actual, direct fix for that failure
+                mode: say plainly, right here, whether the server just
+                accepted or rejected what's currently in the field. */}
+            {tokenStatus === "checking" && <p className="text-xs text-muted-foreground">Checking token&hellip;</p>}
+            {tokenStatus === "ok" && <p className="text-xs text-status-healthy">&#10003; Token accepted by the observer.</p>}
+            {tokenStatus === "rejected" && (
+              <p className="text-xs text-status-critical">
+                &#10007; Rejected by the observer (401) &mdash; this doesn&rsquo;t match its
+                LSTM_AUTOSCALER_API_TOKEN. Re-copy just the token value, nothing else.
+              </p>
+            )}
           </div>
 
           <div className="space-y-1.5">
