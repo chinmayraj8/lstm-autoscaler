@@ -7,6 +7,7 @@ import { Button } from "@/components/ui/button"
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select"
 import { Sheet, SheetContent, SheetTitle } from "@/components/ui/sheet"
 import { useQueryClient } from "@tanstack/react-query"
+import { useMachines } from "@/hooks/queries"
 import { useSystemStatus } from "@/hooks/use-system-status"
 import { useUnauthorized } from "@/hooks/use-unauthorized"
 import { useSettings } from "@/lib/settings"
@@ -16,7 +17,16 @@ export function AppShell() {
   const { settings, setSettings } = useSettings()
   const status = useSystemStatus(settings.machineId)
   const unauthorized = useUnauthorized()
+  const machines = useMachines()
   const queryClient = useQueryClient()
+
+  // Discovered live from Prometheus, same as Settings -- a hardcoded list
+  // here would silently keep offering a node that's since left the
+  // cluster (real IP churn; node-exporter/Docker Desktop can reassign
+  // node IPs across restarts, same as k8s/observer.yaml's own history).
+  // Falls back to just the currently-selected id if discovery is
+  // unreachable, so the dropdown is never empty.
+  const machineOptions = machines.data?.machines.length ? machines.data.machines : [settings.machineId]
 
   return (
     <div className="flex min-h-screen bg-background text-foreground">
@@ -56,8 +66,11 @@ export function AppShell() {
               <SelectValue />
             </SelectTrigger>
             <SelectContent>
-              <SelectItem value="172.18.0.3" className="font-mono text-xs">172.18.0.3</SelectItem>
-              <SelectItem value="172.18.0.5" className="font-mono text-xs">172.18.0.5</SelectItem>
+              {machineOptions.map((id) => (
+                <SelectItem key={id} value={id} className="font-mono text-xs">
+                  {id}
+                </SelectItem>
+              ))}
             </SelectContent>
           </Select>
 
