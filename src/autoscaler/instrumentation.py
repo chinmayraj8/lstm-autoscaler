@@ -19,7 +19,12 @@ timeseries" registration error, since the Counter/Gauge objects below are
 each created exactly once, at import time.
 """
 
-from prometheus_client import CONTENT_TYPE_LATEST, CollectorRegistry, Counter, Gauge, generate_latest
+# CONTENT_TYPE_LATEST re-exported for main.py's GET /metrics (the
+# response media_type) -- unused in this file itself, so the explicit
+# `as CONTENT_TYPE_LATEST` tells ruff this is a deliberate re-export, not
+# a dead import.
+from prometheus_client import CONTENT_TYPE_LATEST as CONTENT_TYPE_LATEST
+from prometheus_client import CollectorRegistry, Counter, Gauge, generate_latest
 
 REGISTRY = CollectorRegistry()
 
