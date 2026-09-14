@@ -20,10 +20,10 @@
 #                 true, rather than just asserted. Skips every test file
 #                 that imports src/api/main.py (which imports TensorFlow
 #                 at module level to build the LSTM model) --
-#                 tests/test_api_shadow.py and
-#                 tests/test_api_forecast_confidence.py, as of this
-#                 writing. Any new API-integration test file added later
-#                 that does `import src.api.main` needs adding here too.
+#                 tests/test_api_shadow.py, tests/test_api_forecast_confidence.py,
+#                 and tests/test_api_auth.py, as of this writing. Any new
+#                 API-integration test file added later that does
+#                 `import src.api.main` needs adding here too.
 #
 #   test-full  -- the complete suite, with the exact pinned
 #                 requirements.txt used by the real Docker image (Step 23),
@@ -65,7 +65,12 @@ jobs:
           grep -v '^tensorflow' requirements.txt > /tmp/requirements-fast.txt
           pip install -r /tmp/requirements-fast.txt -r requirements-dev.txt
       - name: Run the TensorFlow-free suite
-        run: pytest tests/ --ignore=tests/test_api_shadow.py --ignore=tests/test_api_forecast_confidence.py -v
+        run: |
+          pytest tests/ \
+            --ignore=tests/test_api_shadow.py \
+            --ignore=tests/test_api_forecast_confidence.py \
+            --ignore=tests/test_api_auth.py \
+            -v
 
   test-full:
     runs-on: ubuntu-latest

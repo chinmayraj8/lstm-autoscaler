@@ -118,6 +118,22 @@ spec:
             # default Service DNS name).
             - name: LSTM_AUTOSCALER_PROMETHEUS_URL
               value: "http://kube-prometheus-stack-prometheus.monitoring.svc.cluster.local:9090"
+            # Bearer-token auth for every route except GET /health (see
+            # require_auth in src/api/main.py). Sourced from a Secret --
+            # never a plaintext value in this file. Create it once per
+            # cluster before applying this manifest:
+            #   kubectl create secret generic lstm-autoscaler-api-token \
+            #     -n lstm-autoscaler \
+            #     --from-literal=token="$(openssl rand -hex 32)"
+            # If the Secret doesn't exist, the pod fails to start (missing
+            # secretKeyRef) rather than silently running with auth
+            # disabled -- if you want to run without auth on purpose,
+            # remove this env entry rather than skipping the Secret.
+            - name: LSTM_AUTOSCALER_API_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: lstm-autoscaler-api-token
+                  key: token
             # No CSV dataset or lstm_model.keras in this image -- /forecast
             # returns 503; /shadow/* and the live loop are unaffected.
             - name: LSTM_AUTOSCALER_SKIP_LSTM_MODEL

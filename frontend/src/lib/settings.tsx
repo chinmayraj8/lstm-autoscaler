@@ -10,6 +10,7 @@ import { createContext, useContext, useEffect, useMemo, useState, type ReactNode
  */
 export interface Settings {
   observerUrl: string
+  apiToken: string
   prometheusUrl: string
   machineId: string
   refreshIntervalSeconds: number
@@ -19,6 +20,10 @@ export interface Settings {
 
 const DEFAULT_SETTINGS: Settings = {
   observerUrl: "http://localhost:8000",
+  // Empty by default -- an unauthenticated local observer (the default,
+  // LSTM_AUTOSCALER_API_TOKEN unset) works with no header at all. Sent as
+  // `Authorization: Bearer <token>` only when non-empty (see api.ts).
+  apiToken: "",
   // Unlike observerUrl (which the BROWSER calls directly, over the
   // port-forward), this URL is used server-side -- the observer pod
   // itself makes the Prometheus call from inside the cluster (see

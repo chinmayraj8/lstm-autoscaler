@@ -1,6 +1,6 @@
 import { Menu, RefreshCw } from "lucide-react"
 import { useState } from "react"
-import { Outlet } from "react-router-dom"
+import { Link, Outlet } from "react-router-dom"
 import { SidebarNav } from "@/components/layout/sidebar"
 import { StatusPill } from "@/components/status/status-dot"
 import { Button } from "@/components/ui/button"
@@ -8,12 +8,14 @@ import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@
 import { Sheet, SheetContent, SheetTitle } from "@/components/ui/sheet"
 import { useQueryClient } from "@tanstack/react-query"
 import { useSystemStatus } from "@/hooks/use-system-status"
+import { useUnauthorized } from "@/hooks/use-unauthorized"
 import { useSettings } from "@/lib/settings"
 
 export function AppShell() {
   const [mobileNavOpen, setMobileNavOpen] = useState(false)
   const { settings, setSettings } = useSettings()
   const status = useSystemStatus(settings.machineId)
+  const unauthorized = useUnauthorized()
   const queryClient = useQueryClient()
 
   return (
@@ -40,6 +42,12 @@ export function AppShell() {
           </StatusPill>
 
           <span className="hidden font-mono text-xs text-muted-foreground sm:inline">{status.note}</span>
+
+          {unauthorized && (
+            <Link to="/settings">
+              <StatusPill tone="critical">Not authenticated</StatusPill>
+            </Link>
+          )}
 
           <div className="flex-1" />
 

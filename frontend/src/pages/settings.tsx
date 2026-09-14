@@ -40,6 +40,24 @@ export default function SettingsPage() {
           </div>
 
           <div className="space-y-1.5">
+            <Label htmlFor="api-token">API token</Label>
+            <Input
+              id="api-token"
+              type="password"
+              autoComplete="off"
+              value={settings.apiToken}
+              onChange={(e) => setSettings({ apiToken: e.target.value })}
+              className="font-mono text-sm"
+              placeholder="leave blank if the observer has no LSTM_AUTOSCALER_API_TOKEN set"
+            />
+            <p className="text-xs text-muted-foreground">
+              Sent as <code className="font-mono">Authorization: Bearer &lt;token&gt;</code> on every request when
+              set. Leave blank against an unauthenticated observer &mdash; no header is sent at all, rather than a
+              blank one.
+            </p>
+          </div>
+
+          <div className="space-y-1.5">
             <Label htmlFor="prometheus-url">Prometheus URL</Label>
             <Input
               id="prometheus-url"

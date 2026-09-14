@@ -87,6 +87,7 @@ itself has no notion of a database.
 
 from __future__ import annotations
 
+import hmac
 import logging
 import os
 import sys
@@ -99,7 +100,7 @@ from typing import List, Optional
 
 import numpy as np
 import requests as _requests
-from fastapi import FastAPI, HTTPException
+from fastapi import Depends, FastAPI, Header, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 from sklearn.preprocessing import MinMaxScaler
@@ -187,6 +188,33 @@ _PROMETHEUS_URL = os.environ.get("LSTM_AUTOSCALER_PROMETHEUS_URL", "").strip() o
 _live_loop_stop_event = threading.Event()
 _live_loop_thread: Optional[threading.Thread] = None
 
+# Access control. Unset (the default for a fresh checkout): every route is
+# open, loudly warned about at startup below rather than silently allowed.
+# Set: a FastAPI dependency, not middleware, so each protected route opts
+# in explicitly via `dependencies=[Depends(require_auth)]` in its own
+# decorator -- the route list itself shows what's protected, instead of a
+# blanket rule living somewhere else that's easy to lose track of.
+_API_TOKEN = os.environ.get("LSTM_AUTOSCALER_API_TOKEN", "").strip() or None
+
+
+async def require_auth(authorization: Optional[str] = Header(None)) -> None:
+    """Bearer-token check for every route except GET /health (see that
+    route for why it's exempt). Compares with `hmac.compare_digest`, not
+    `==` -- a plain `==` short-circuits on the first mismatched byte,
+    which leaks how many leading characters of a guess were correct
+    through response timing; `compare_digest` runs in constant time
+    regardless of where the strings first differ."""
+    if _API_TOKEN is None:
+        return
+    if authorization is None or not authorization.startswith("Bearer "):
+        raise HTTPException(
+            status_code=401,
+            detail="Missing Authorization header. Expected: Bearer <token>.",
+        )
+    provided = authorization.removeprefix("Bearer ")
+    if not hmac.compare_digest(provided, _API_TOKEN):
+        raise HTTPException(status_code=401, detail="Invalid API token.")
+
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -194,6 +222,11 @@ async def lifespan(app: FastAPI):
     LSTM_AUTOSCALER_SKIP_LSTM_MODEL is set), then optionally start the live
     forecasting loop (if LSTM_AUTOSCALER_PROMETHEUS_URL is set)."""
     warnings.filterwarnings("ignore")
+
+    if _API_TOKEN is None:
+        print("[startup] LSTM_AUTOSCALER_API_TOKEN not set — authentication is DISABLED. "
+              "Every route except GET /health is open with no access control. Set this "
+              "env var before exposing this service beyond a trusted network.")
 
     if _SKIP_LSTM_MODEL:
         print("[startup] LSTM_AUTOSCALER_SKIP_LSTM_MODEL set — skipping LSTM model/scaler load. "
@@ -316,15 +349,15 @@ app = FastAPI(
 )
 
 # The React frontend (Vite dev server, or a static build served from a
-# different origin) calls this API cross-origin. No cookie/session auth
-# exists anywhere in this service to protect (every route above is
-# unauthenticated read/write already), so a wildcard origin doesn't widen
-# this service's real attack surface -- it only stops the browser from
-# blocking a request `curl`/`requests` could already make freely.
-# LSTM_AUTOSCALER_CORS_ORIGINS overrides with a comma-separated allowlist
-# for a deployment that wants one.
+# different origin) calls this API cross-origin. Defaults to just the real
+# frontend dev origin -- secure by default on a fresh checkout, not open
+# by default -- rather than "*"; a wildcard origin combined with a bearer
+# token in an Authorization header is also simply invalid per the CORS
+# spec once credentials/auth are in play. LSTM_AUTOSCALER_CORS_ORIGINS
+# overrides with a comma-separated allowlist (e.g. the real cluster-
+# internal origin, once this is deployed somewhere less trusted).
 _cors_origins_env = os.environ.get("LSTM_AUTOSCALER_CORS_ORIGINS", "").strip()
-_cors_origins = [o.strip() for o in _cors_origins_env.split(",") if o.strip()] or ["*"]
+_cors_origins = [o.strip() for o in _cors_origins_env.split(",") if o.strip()] or ["http://localhost:5173"]
 app.add_middleware(
     CORSMiddleware,
     allow_origins=_cors_origins,
@@ -418,13 +451,20 @@ class HealthResponse(BaseModel):
 
 # ── Endpoints ─────────────────────────────────────────────────────────────────
 
+# Deliberately the one route with no `dependencies=[Depends(require_auth)]`,
+# even when LSTM_AUTOSCALER_API_TOKEN is set -- not an oversight. Kubernetes
+# liveness/readiness probes hit this exact path and can't easily carry a
+# bearer token; a probe that can't reach /health because of auth would make
+# the pod flap. It leaks no sensitive state (see HealthResponse) worth
+# gating behind a token.
 @app.get("/health", response_model=HealthResponse, tags=["ops"])
 def health() -> HealthResponse:
     """Liveness check. Returns 503 only if startup hasn't finished at all
     (e.g. still loading, or a real startup failure). Does NOT require the
     LSTM model specifically — `LSTM_AUTOSCALER_SKIP_LSTM_MODEL` (Step 22)
     lets a minimal observer deployment start without it; check
-    `lstm_model_loaded` for that, not the overall status."""
+    `lstm_model_loaded` for that, not the overall status. Always
+    unauthenticated -- see the comment above this route."""
     if "started_at" not in _state:
         raise HTTPException(status_code=503, detail="Still starting up.")
     return HealthResponse(
@@ -441,7 +481,7 @@ def health() -> HealthResponse:
     )
 
 
-@app.post("/forecast", response_model=ForecastResponse, tags=["inference"])
+@app.post("/forecast", response_model=ForecastResponse, tags=["inference"], dependencies=[Depends(require_auth)])
 def forecast(req: ForecastRequest) -> ForecastResponse:
     """
     Given the last 30 minutes of CPU utilisation, return:
@@ -552,7 +592,10 @@ class ObservedDecisionListResponse(BaseModel):
     )
 
 
-@app.post("/shadow/{machine_id}/window", response_model=ShadowWindowResponse, tags=["shadow"])
+@app.post(
+    "/shadow/{machine_id}/window", response_model=ShadowWindowResponse, tags=["shadow"],
+    dependencies=[Depends(require_auth)],
+)
 def submit_shadow_window(machine_id: str, req: ShadowWindowRequest) -> ShadowWindowResponse:
     """
     Score one already-observed shadow window's real demand against BOTH
@@ -604,7 +647,10 @@ def submit_shadow_window(machine_id: str, req: ShadowWindowRequest) -> ShadowWin
     )
 
 
-@app.get("/shadow/{machine_id}", response_model=ShadowStatusResponse, tags=["shadow"])
+@app.get(
+    "/shadow/{machine_id}", response_model=ShadowStatusResponse, tags=["shadow"],
+    dependencies=[Depends(require_auth)],
+)
 def shadow_status(machine_id: str) -> ShadowStatusResponse:
     """Current shadow-evaluation state for one machine: which forecaster
     controls it right now, how many shadow windows are banked, cumulative
@@ -635,7 +681,10 @@ def shadow_status(machine_id: str) -> ShadowStatusResponse:
     )
 
 
-@app.get("/shadow/{machine_id}/windows", response_model=ShadowWindowListResponse, tags=["shadow"])
+@app.get(
+    "/shadow/{machine_id}/windows", response_model=ShadowWindowListResponse, tags=["shadow"],
+    dependencies=[Depends(require_auth)],
+)
 def shadow_windows(machine_id: str) -> ShadowWindowListResponse:
     """The full per-window audit log for one machine -- every shadow
     window ever banked, each with both forecasters' cost/SLA for that
@@ -659,7 +708,10 @@ def shadow_windows(machine_id: str) -> ShadowWindowListResponse:
     )
 
 
-@app.get("/shadow/{machine_id}/decisions", response_model=ObservedDecisionListResponse, tags=["shadow"])
+@app.get(
+    "/shadow/{machine_id}/decisions", response_model=ObservedDecisionListResponse, tags=["shadow"],
+    dependencies=[Depends(require_auth)],
+)
 def shadow_decisions(machine_id: str, limit: int = 500) -> ObservedDecisionListResponse:
     """The live forecasting loop's per-tick observed-decision log (Step 22)
     for one node: every tick's forecast + would-be scaling action, whether
@@ -693,7 +745,10 @@ class ReplicasResponse(BaseModel):
     checked_at: str
 
 
-@app.get("/replicas/{deployment}", response_model=ReplicasResponse, tags=["cluster"])
+@app.get(
+    "/replicas/{deployment}", response_model=ReplicasResponse, tags=["cluster"],
+    dependencies=[Depends(require_auth)],
+)
 def replicas(deployment: str, namespace: str = "lstm-autoscaler") -> ReplicasResponse:
     """Current replica count of a real Deployment, read live via the local/
     in-cluster kubeconfig (`actuator.get_current_replicas`, unmodified --
@@ -720,7 +775,10 @@ class CpuMetricsResponse(BaseModel):
     readings: List[CpuReading]
 
 
-@app.get("/metrics/cpu", response_model=CpuMetricsResponse, tags=["cluster"])
+@app.get(
+    "/metrics/cpu", response_model=CpuMetricsResponse, tags=["cluster"],
+    dependencies=[Depends(require_auth)],
+)
 def metrics_cpu(
     machine_id: str,
     prometheus_url: str = _PROMETHEUS_URL or DEFAULT_PROMETHEUS_URL,
@@ -756,7 +814,7 @@ class MachinesResponse(BaseModel):
     machines: List[str]
 
 
-@app.get("/machines", response_model=MachinesResponse, tags=["cluster"])
+@app.get("/machines", response_model=MachinesResponse, tags=["cluster"], dependencies=[Depends(require_auth)])
 def machines(prometheus_url: str = _PROMETHEUS_URL or DEFAULT_PROMETHEUS_URL) -> MachinesResponse:
     """Every node currently visible to Prometheus right now
     (`PrometheusMetricsSource.list_machine_ids`, unmodified) -- lets the
@@ -782,7 +840,7 @@ class ScalingConfigResponse(BaseModel):
     tick_seconds: int
 
 
-@app.get("/config", response_model=ScalingConfigResponse, tags=["ops"])
+@app.get("/config", response_model=ScalingConfigResponse, tags=["ops"], dependencies=[Depends(require_auth)])
 def scaling_config() -> ScalingConfigResponse:
     """The effective scaling-decision thresholds this service is actually
     running with right now -- the real values `_decide_scaling` and the
@@ -818,7 +876,10 @@ class ActuationStatusResponse(BaseModel):
     cooldown_remaining_seconds: Optional[float] = None
 
 
-@app.get("/actuation/status", response_model=ActuationStatusResponse, tags=["ops"])
+@app.get(
+    "/actuation/status", response_model=ActuationStatusResponse, tags=["ops"],
+    dependencies=[Depends(require_auth)],
+)
 def actuation_status() -> ActuationStatusResponse:
     """Live real-actuation config + circuit-breaker state (Step 26 / Step
     26 follow-up), read directly off the SAME `LiveLoopConfig` object
@@ -884,7 +945,10 @@ class ForecastConfidenceResponse(BaseModel):
     forecast: List[ForecastPoint]
 
 
-@app.get("/forecast/confidence", response_model=ForecastConfidenceResponse, tags=["inference"])
+@app.get(
+    "/forecast/confidence", response_model=ForecastConfidenceResponse, tags=["inference"],
+    dependencies=[Depends(require_auth)],
+)
 def forecast_confidence(
     machine_id: str,
     prometheus_url: str = _PROMETHEUS_URL or DEFAULT_PROMETHEUS_URL,
