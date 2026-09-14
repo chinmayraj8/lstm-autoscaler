@@ -1,6 +1,0 @@
-seed,lstm_forecast_rmse,lstm_forecast_mae,naive_baseline_rmse,lstm_sla_violation_rate_pct,reactive_sla_violation_rate_pct,lstm_over_prov_waste_pct,reactive_over_prov_waste_pct,lstm_cost_score,reactive_cost_score,epochs_trained,wall_clock_secs
-42,0.578563,0.43746,0.753139,0.2208,0.4415,0.6623,4.6358,0.050773,0.134658,60,19.7
-43,0.584596,0.439827,0.753139,0.4415,0.4415,0.2208,4.6358,0.090508,0.134658,60,17.5
-44,0.581392,0.439071,0.753139,0.2208,0.4415,0.6623,4.6358,0.050773,0.134658,57,16.6
-45,0.584997,0.438752,0.753139,0.4415,0.4415,0.0,4.6358,0.0883,0.134658,60,17.4
-46,0.583814,0.438497,0.753139,0.4415,0.4415,0.0,4.6358,0.0883,0.134658,46,13.7

@@ -7,12 +7,12 @@ telemetry, with an explicit statistical gate deciding which forecaster
 actually drives scaling. Real actuation (patching a Deployment's replica
 count) is wired and can be enabled, but is off by default.
 
-This started as a notebook-based research project (see **Dataset** below)
-and has since grown into a live system: a FastAPI service running in the
-cluster, a durable shadow-evaluation store, and a React ops console. The
-notebook and offline experiments are still here and still matter — they're
-what the live system's methodology is built on — but they are no longer
-the whole project.
+This started as offline research — ARIMA and LSTM forecasting tuned and
+validated against the Alibaba Cluster Trace 2018 — and has since grown
+into a live system: a FastAPI service running in the cluster, a durable
+shadow-evaluation store, and a React ops console. The forecasting and
+decision-engine logic in `src/autoscaler/` is that same validated
+methodology, carried forward unchanged into the live path.
 
 ## Current status
 
@@ -31,9 +31,6 @@ the whole project.
   retired now that the new frontend is verified against the real cluster.
 - **CI**: GitHub Actions runs lint + the test suite on every push (see
   `.github/workflows/ci.yml`).
-
-For the detailed, dated engineering history behind every one of these
-decisions, see `progress/00_INDEX.md`.
 
 ## Architecture
 
@@ -58,16 +55,13 @@ frontend/         React + TypeScript + Vite + Tailwind + shadcn/ui +
 k8s/              Manifests for the observer Deployment/Service, the
                   actuation RBAC, the demo workload it scales, and a
                   synthetic load generator.
-experiments/      The offline research pipeline (ARIMA/LSTM tuning,
-                  multi-machine/multi-seed sweeps) against the Alibaba
-                  Cluster Trace 2018 CSV. This is where the forecasting
-                  methodology was originally validated.
 tests/            pytest suite covering the autoscaler package and the
                   API's /shadow endpoints.
-progress/         Dated, numbered engineering log — one entry per real
-                  step of work, newest first in 00_INDEX.md.
 scripts/          One-off/offline tools: bootstrapping a shadow window
                   from real history, training a real hybrid model per node.
+models/hybrid_residual/
+                  The real trained per-node residual-hybrid LSTM models
+                  (.keras) the live loop actually loads.
 ```
 
 ## Getting started
@@ -78,14 +72,13 @@ scripts/          One-off/offline tools: bootstrapping a shadow window
 python3.11 -m venv venv
 source venv/bin/activate
 pip install -r requirements.txt -r requirements-dev.txt
-# Local Apple Silicon training/notebook work also wants:
-pip install tensorflow-macos tensorflow-metal matplotlib jupyter notebook
 
 pytest tests/ -v
 ```
 
-Run the API locally (without the LSTM point-forecast model, which needs
-the Kaggle CSV below):
+Run the API locally, skipping the optional legacy `/forecast` endpoint
+(its LSTM point-forecast model isn't part of this repository —
+`/shadow/*`, the live loop, and everything else are unaffected):
 
 ```bash
 LSTM_AUTOSCALER_SKIP_LSTM_MODEL=1 uvicorn src.api.main:app --reload
@@ -120,19 +113,3 @@ kubectl apply -f k8s/actuation-rbac.yaml -f k8s/demo-workload.yaml -f k8s/load-g
 
 See `k8s/observer.yaml`'s own comments for the Docker-Desktop-specific
 local-registry step and every environment variable it reads.
-
-## Dataset
-
-The offline experiments and the original notebook train against
-`machine_usage_bigger.csv` from the Alibaba Cluster Trace 2018
-(https://www.kaggle.com/datasets/akshatpandey01/alibaba-cluster-trace-2018).
-Download it and place it in the project root (or point
-`LSTM_AUTOSCALER_DATA_PATH` at it) before running `experiments/*.py` or
-`lstm_autoscaler.ipynb`. The live system does not need this file — it
-forecasts from real Prometheus history instead.
-
-## Further reading
-
-- `progress/00_INDEX.md` — the full, dated history of every real step of
-  work on this project, newest first.
-- `docs/` — status/summary/demo write-ups.

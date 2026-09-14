@@ -5,5 +5,13 @@ __pycache__/
 venv/
 .ipynb_checkpoints/
 _to_delete/
-experiments/_tmp_*.keras
-docs/resume_draft.md
+.claude/
+
+# Public-release cleanup: research/process artifacts kept on local disk,
+# not tracked going forward. See the commit that added this block for why.
+docs/
+progress/
+experiments/
+outputs/
+lstm_autoscaler.ipynb
+lstm_model.keras
