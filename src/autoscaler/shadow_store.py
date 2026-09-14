@@ -119,6 +119,13 @@ _MACHINES_ADD_LAST_RECOMMENDED_SERVERS = (
     "ALTER TABLE machines ADD COLUMN last_recommended_servers INTEGER"
 )
 
+# Same additive-migration pattern, for the hybrid-model-version auditability
+# column: existing local DB files have a `shadow_windows` table (via CREATE
+# TABLE IF NOT EXISTS above) with no `hybrid_model_version` column yet.
+_SHADOW_WINDOWS_ADD_HYBRID_MODEL_VERSION = (
+    "ALTER TABLE shadow_windows ADD COLUMN hybrid_model_version TEXT"
+)
+
 
 class ShadowStore:
     """SQLite-backed durable store for shadow-mode state. `db_path` may be
@@ -142,6 +149,11 @@ class ShadowStore:
             conn.executescript(_SCHEMA)
             try:
                 conn.execute(_MACHINES_ADD_LAST_RECOMMENDED_SERVERS)
+            except sqlite3.OperationalError as e:
+                if "duplicate column" not in str(e).lower():
+                    raise
+            try:
+                conn.execute(_SHADOW_WINDOWS_ADD_HYBRID_MODEL_VERSION)
             except sqlite3.OperationalError as e:
                 if "duplicate column" not in str(e).lower():
                     raise
@@ -190,7 +202,8 @@ class ShadowStore:
             last_evaluated_at = datetime.fromisoformat(row[1]) if row and row[1] else None
 
             window_rows = conn.execute(
-                "SELECT window_start, window_end, arima_cost, arima_sla_pct, hybrid_cost, hybrid_sla_pct "
+                "SELECT window_start, window_end, arima_cost, arima_sla_pct, hybrid_cost, hybrid_sla_pct, "
+                "hybrid_model_version "
                 "FROM shadow_windows WHERE machine_id = ? ORDER BY window_start DESC, id DESC LIMIT ?",
                 (machine_id, window_limit),
             ).fetchall()
@@ -202,6 +215,7 @@ class ShadowStore:
                     machine_id=machine_id,
                     window_start=datetime.fromisoformat(r[0]), window_end=datetime.fromisoformat(r[1]),
                     arima_cost=r[2], arima_sla_pct=r[3], hybrid_cost=r[4], hybrid_sla_pct=r[5],
+                    hybrid_model_version=r[6],
                 )
                 for r in window_rows
             ]
@@ -230,7 +244,8 @@ class ShadowStore:
         distinct from `load_state`'s decision-relevant capped subset."""
         with self._connect() as conn:
             rows = conn.execute(
-                "SELECT window_start, window_end, arima_cost, arima_sla_pct, hybrid_cost, hybrid_sla_pct "
+                "SELECT window_start, window_end, arima_cost, arima_sla_pct, hybrid_cost, hybrid_sla_pct, "
+                "hybrid_model_version "
                 "FROM shadow_windows WHERE machine_id = ? ORDER BY window_start, id",
                 (machine_id,),
             ).fetchall()
@@ -239,6 +254,7 @@ class ShadowStore:
                 machine_id=machine_id,
                 window_start=datetime.fromisoformat(r[0]), window_end=datetime.fromisoformat(r[1]),
                 arima_cost=r[2], arima_sla_pct=r[3], hybrid_cost=r[4], hybrid_sla_pct=r[5],
+                hybrid_model_version=r[6],
             )
             for r in rows
         ]
@@ -352,11 +368,12 @@ class ShadowStore:
             )
             conn.execute(
                 "INSERT INTO shadow_windows "
-                "(machine_id, window_start, window_end, arima_cost, arima_sla_pct, hybrid_cost, hybrid_sla_pct, recorded_at) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                "(machine_id, window_start, window_end, arima_cost, arima_sla_pct, hybrid_cost, hybrid_sla_pct, "
+                "recorded_at, hybrid_model_version) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 (machine_id, window.window_start.isoformat(), window.window_end.isoformat(),
                  window.arima_cost, window.arima_sla_pct, window.hybrid_cost, window.hybrid_sla_pct,
-                 recorded_at.isoformat()),
+                 recorded_at.isoformat(), window.hybrid_model_version),
             )
 
     def _save_last_evaluated(self, machine_id: str, last_evaluated_at: Optional[datetime]) -> None:

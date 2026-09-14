@@ -9,6 +9,8 @@ proving the plumbing is correct without requiring a real trained artifact,
 which does not exist (see live_loop.py's module docstring).
 """
 
+import hashlib
+import os
 import threading
 from datetime import datetime, timedelta
 from unittest.mock import patch
@@ -22,6 +24,7 @@ from src.autoscaler.live_loop import (
     HybridModelUnavailable,
     LiveLoopConfig,
     _build_hybrid_window,
+    _load_hybrid_residual_model,
     observe_node_once,
     resolve_tracked_machine_ids,
     run_scheduler_loop,
@@ -497,7 +500,7 @@ def test_run_tick_actuation_circuit_breaker_open_does_not_skip_the_hybrid_shadow
     cfg._actuation_circuit_opened_at = T0 + timedelta(hours=3)  # forced open
 
     def _stub_loader(machine_id, model_dir):
-        return _StubResidualModel()
+        return _StubResidualModel(), "stub-version"
 
     with patch("src.autoscaler.actuator.set_replicas") as fake_set:
         summary = run_tick(store, source, ["m_a"], T0 + timedelta(hours=3, minutes=10), cfg,
@@ -537,7 +540,7 @@ def test_run_tick_hybrid_assigned_node_with_stub_model_banks_a_window():
     cfg = LiveLoopConfig(fit_lookback_hours=1.0, shadow_fit_hours=1.0, shadow_window_hours=1.5)
 
     def _stub_loader(machine_id, model_dir):
-        return _StubResidualModel()
+        return _StubResidualModel(), "stub-version"
 
     summary = run_tick(store, source, ["m_test"], now, cfg, model_loader=_stub_loader)
 
@@ -547,6 +550,7 @@ def test_run_tick_hybrid_assigned_node_with_stub_model_banks_a_window():
     assert len(history) == 1
     # Zero-residual stub -> hybrid forecast == ARIMA forecast exactly -> equal cost.
     assert history[0].hybrid_cost == pytest.approx(history[0].arima_cost)
+    assert history[0].hybrid_model_version == "stub-version"
 
 
 def test_build_hybrid_window_raises_when_model_missing():
@@ -561,7 +565,65 @@ def test_build_hybrid_window_raises_on_insufficient_history():
     cfg = LiveLoopConfig(shadow_fit_hours=6.0, shadow_window_hours=24.0)
     with pytest.raises(HybridModelUnavailable):
         _build_hybrid_window("m_test", source, cfg, T0 + timedelta(minutes=30),
-                             model_loader=lambda mid, d: _StubResidualModel())
+                             model_loader=lambda mid, d: (_StubResidualModel(), "stub-version"))
+
+
+# ── hybrid_model_version: content hash for auditability (needs TensorFlow, --
+#    skipped under test-fast, same as test_train_hybrid.py's end-to-end test) ─
+
+def test_load_hybrid_residual_model_version_is_deterministic_and_content_based(tmp_path):
+    pytest.importorskip("tensorflow")
+    from src.autoscaler.forecasting import _build_lstm_model
+
+    model_dir = tmp_path / "hybrid_residual"
+    model_dir.mkdir()
+    path = model_dir / "m_test.keras"
+    _build_lstm_model(config.LOOKBACK_STEPS, config.HORIZON_STEPS).save(str(path))  # full save -- same convention .keras files use elsewhere
+
+    _, version1 = _load_hybrid_residual_model("m_test", str(model_dir))
+    _, version2 = _load_hybrid_residual_model("m_test", str(model_dir))
+    assert version1 == version2
+    assert version1 == hashlib.sha256(path.read_bytes()).hexdigest()[:12]
+
+    # Touch mtime only (e.g. what `cp -p` or a redeploy that re-lays-down
+    # identical bytes would do) -- the version must be unaffected, since
+    # it's a hash of the file's CONTENT, not its filesystem metadata.
+    original_mtime = path.stat().st_mtime
+    os.utime(path, (original_mtime + 1000, original_mtime + 1000))
+    _, version3 = _load_hybrid_residual_model("m_test", str(model_dir))
+    assert version3 == version1
+
+
+def test_run_tick_banks_a_window_carrying_the_real_loaded_models_version(tmp_path):
+    pytest.importorskip("tensorflow")
+    from src.autoscaler.forecasting import _build_lstm_model
+
+    model_dir = tmp_path / "hybrid_residual"
+    model_dir.mkdir()
+    path = model_dir / "m_test.keras"
+    _build_lstm_model(config.LOOKBACK_STEPS, config.HORIZON_STEPS).save(str(path))  # full save -- same convention .keras files use elsewhere
+    expected_version = hashlib.sha256(path.read_bytes()).hexdigest()[:12]
+
+    source = _source(n_hours=4, cadence_minutes=5)
+    store = ShadowStore(":memory:")
+    _seed_hybrid_assignment(store, "m_test")
+    assert store.load_state("m_test").current_forecaster == "hybrid"
+
+    now = T0 + timedelta(hours=3, minutes=30)
+    cfg = LiveLoopConfig(
+        fit_lookback_hours=1.0, shadow_fit_hours=1.0, shadow_window_hours=1.5,
+        hybrid_model_dir=str(model_dir),
+    )
+
+    # No model_loader override this time -- exercises the REAL
+    # _load_hybrid_residual_model, not the stub every other hybrid-path
+    # test in this file uses.
+    summary = run_tick(store, source, ["m_test"], now, cfg)
+
+    assert summary["shadow_evaluated"] == ["m_test"]
+    history = store.get_full_window_history("m_test")
+    assert len(history) == 1
+    assert history[0].hybrid_model_version == expected_version
 
 
 # ── Node discovery ────────────────────────────────────────────────────────

@@ -85,6 +85,7 @@ dependency unless asked" preference this project applied to `shadow_store`
 choosing `sqlite3` over an ORM (Step 19).
 """
 
+import hashlib
 import logging
 import os
 from dataclasses import dataclass
@@ -299,22 +300,32 @@ def observe_node_once(machine_id: str, source: MetricsSource, store: ShadowStore
 
 # ── Path 2: hybrid re-validation, only for already-hybrid-assigned nodes ───
 
-def _load_hybrid_residual_model(machine_id: str, model_dir: str):
+def _load_hybrid_residual_model(machine_id: str, model_dir: str) -> Tuple[object, str]:
     """Lazily imports TensorFlow only on an actual load attempt -- keeps
     this module importable (and the ARIMA-only path testable/runnable)
     without a TensorFlow install, same isolation principle
     `forecasting.py`'s module docstring documents. Looks for
     `{model_dir}/{machine_id}.keras`; this per-machine convention has no
-    real trained artifact behind it anywhere yet (see module docstring)."""
+    real trained artifact behind it anywhere yet (see module docstring).
+
+    Returns `(model, version)`, where `version` is a short content hash
+    (SHA-256 of the raw file bytes, first 12 hex chars) of the exact
+    `.keras` file just loaded -- deliberately the file's CONTENT, not its
+    mtime, since mtime can change (a `cp -p`, a redeploy that re-lays-down
+    identical bytes) without the actual weights changing, and this is
+    meant purely for auditing which weights produced a given shadow
+    window's hybrid forecast, not a rollback mechanism."""
     path = os.path.join(model_dir, f"{machine_id}.keras")
     if not os.path.exists(path):
         raise HybridModelUnavailable(
             f"no pretrained residual model for machine_id={machine_id!r} at {path!r}"
         )
+    with open(path, "rb") as f:
+        version = hashlib.sha256(f.read()).hexdigest()[:12]
     from .forecasting import _build_lstm_model
     model = _build_lstm_model(config.LOOKBACK_STEPS, config.HORIZON_STEPS)
     model.load_weights(path)
-    return model
+    return model, version
 
 
 def _build_hybrid_window(machine_id: str, source: MetricsSource, cfg: LiveLoopConfig,
@@ -344,7 +355,7 @@ def _build_hybrid_window(machine_id: str, source: MetricsSource, cfg: LiveLoopCo
     inverse-transforming -- same convention `_arima_rolling_forecast`
     itself uses for its own clip.
     """
-    model = model_loader(machine_id, cfg.hybrid_model_dir)  # raises HybridModelUnavailable first, cheaply
+    model, hybrid_model_version = model_loader(machine_id, cfg.hybrid_model_dir)  # raises HybridModelUnavailable first, cheaply
 
     from .data import _make_sequences
 
@@ -387,6 +398,7 @@ def _build_hybrid_window(machine_id: str, source: MetricsSource, cfg: LiveLoopCo
         arima_pred_real, dec_cfg, cfg.safety_margin,
         hybrid_pred_real, dec_cfg, cfg.safety_margin,
         demand_scale=cfg.demand_scale,
+        hybrid_model_version=hybrid_model_version,
     )
 
 

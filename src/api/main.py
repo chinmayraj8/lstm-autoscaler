@@ -567,7 +567,9 @@ class ShadowWindowRequest(BaseModel):
 
 class ShadowWindowResponse(BaseModel):
     machine_id: str
-    window_result: dict = Field(description="arima_cost/arima_sla_pct/hybrid_cost/hybrid_sla_pct for this window.")
+    window_result: dict = Field(
+        description="arima_cost/arima_sla_pct/hybrid_cost/hybrid_sla_pct/hybrid_model_version for this window."
+    )
     current_forecaster: str = Field(description='"arima" or "hybrid" -- the forecaster now controlling this machine.')
     assignment_changed: bool
     verdict: Optional[str] = Field(None, description="Set only when assignment_changed is true.")
@@ -588,7 +590,9 @@ class ShadowWindowListResponse(BaseModel):
     machine_id: str
     windows: List[dict] = Field(
         description="Every shadow window ever banked for this machine, oldest first -- "
-                    "window_start/window_end, arima_cost/arima_sla_pct, hybrid_cost/hybrid_sla_pct."
+                    "window_start/window_end, arima_cost/arima_sla_pct, hybrid_cost/hybrid_sla_pct, "
+                    "hybrid_model_version (the .keras file's content hash at build time, for "
+                    "auditability -- null for windows with no real hybrid model behind them)."
     )
 
 
@@ -652,6 +656,7 @@ def submit_shadow_window(machine_id: str, req: ShadowWindowRequest) -> ShadowWin
         window_result={
             "arima_cost": window.arima_cost, "arima_sla_pct": window.arima_sla_pct,
             "hybrid_cost": window.hybrid_cost, "hybrid_sla_pct": window.hybrid_sla_pct,
+            "hybrid_model_version": window.hybrid_model_version,
         },
         current_forecaster=state.current_forecaster,
         assignment_changed=change is not None,
@@ -716,6 +721,7 @@ def shadow_windows(machine_id: str) -> ShadowWindowListResponse:
                 "window_start": w.window_start.isoformat(), "window_end": w.window_end.isoformat(),
                 "arima_cost": w.arima_cost, "arima_sla_pct": w.arima_sla_pct,
                 "hybrid_cost": w.hybrid_cost, "hybrid_sla_pct": w.hybrid_sla_pct,
+                "hybrid_model_version": w.hybrid_model_version,
             }
             for w in windows
         ],

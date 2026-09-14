@@ -73,7 +73,15 @@ DEFAULT_REEVAL_CADENCE_DAYS = 30
 class ShadowWindowResult:
     """One 24-hour (or caller-defined) shadow window's scored comparison.
     Both costs come from the identical decision engine + simulator, applied
-    to the same real demand series -- only the forecast feeding in differs."""
+    to the same real demand series -- only the forecast feeding in differs.
+
+    `hybrid_model_version` is a short content hash (see
+    `live_loop._load_hybrid_residual_model`) of the exact `.keras` file the
+    hybrid forecast for this window was produced from -- for auditability
+    only (which weights produced this number), not a rollback mechanism.
+    None for windows with no real hybrid model behind them at all (e.g.
+    `/shadow/{id}/window`'s hand-submitted forecasts, which aren't tied to
+    any specific loaded artifact)."""
     machine_id: str
     window_start: datetime
     window_end: datetime
@@ -81,6 +89,7 @@ class ShadowWindowResult:
     arima_sla_pct: float
     hybrid_cost: float
     hybrid_sla_pct: float
+    hybrid_model_version: Optional[str] = None
 
 
 @dataclass
@@ -138,14 +147,18 @@ def run_shadow_window(machine_id: str, window_start: datetime, window_end: datet
                       arima_pred_real: np.ndarray, arima_dec_cfg: DecisionConfig, arima_safety_margin: float,
                       hybrid_pred_real: np.ndarray, hybrid_dec_cfg: DecisionConfig, hybrid_safety_margin: float,
                       demand_scale: float, sim_cfg: Optional[SimConfig] = None,
-                      target_builder=_build_lstm_targets) -> ShadowWindowResult:
+                      target_builder=_build_lstm_targets,
+                      hybrid_model_version: Optional[str] = None) -> ShadowWindowResult:
     """Score one shadow window for both forecasters against the SAME real
     demand data (`y_actual_real`) -- neither forecaster's targets are ever
     applied to the real fleet here; this only computes what each WOULD have
     cost, via the unmodified simulator. `arima_dec_cfg`/`hybrid_dec_cfg`
     are each forecaster's own already-validation-tuned decision params
     (produced elsewhere, e.g. `tune_on_validation`/`tune_arima_on_validation`
-    -- this module does no tuning of its own)."""
+    -- this module does no tuning of its own). `hybrid_model_version`
+    (see `ShadowWindowResult`) is passed straight through -- this function
+    has no opinion on where it came from, only `live_loop.py`'s live path
+    ever supplies one."""
     sim_cfg = sim_cfg or SimConfig()
     arima_cost, arima_sla = score_forecaster_window(
         arima_pred_real, y_actual_real, arima_dec_cfg, sim_cfg, demand_scale, arima_safety_margin, target_builder)
@@ -155,6 +168,7 @@ def run_shadow_window(machine_id: str, window_start: datetime, window_end: datet
         machine_id=machine_id, window_start=window_start, window_end=window_end,
         arima_cost=arima_cost, arima_sla_pct=arima_sla,
         hybrid_cost=hybrid_cost, hybrid_sla_pct=hybrid_sla,
+        hybrid_model_version=hybrid_model_version,
     )
 
 

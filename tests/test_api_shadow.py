@@ -103,7 +103,11 @@ def test_windows_endpoint_lists_every_banked_window():
     for w in body["windows"]:
         assert set(w.keys()) == {
             "window_start", "window_end", "arima_cost", "arima_sla_pct", "hybrid_cost", "hybrid_sla_pct",
+            "hybrid_model_version",
         }
+        # Hand-submitted via /shadow/{id}/window -- not tied to any real
+        # loaded .keras file, so no version to report.
+        assert w["hybrid_model_version"] is None
 
 
 def test_mismatched_shapes_returns_400():
