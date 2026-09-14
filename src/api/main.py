@@ -93,12 +93,14 @@ import sys
 import threading
 import warnings
 from contextlib import asynccontextmanager
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import List, Optional
 
 import numpy as np
+import requests as _requests
 from fastapi import FastAPI, HTTPException
+from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 
 # Step 25: without a configured handler, the `autoscaler.*` module loggers
@@ -125,7 +127,11 @@ if str(_ROOT) not in sys.path:
 
 from src.autoscaler import (  # noqa: E402
     DEMAND_SCALE,
+    DEC_MAX_SERVERS,
+    DEC_MIN_SERVERS,
     DEC_OVER_WEIGHT,
+    DEC_SCALE_STEP,
+    DEC_SERVER_CAPACITY,
     DEC_UNDER_WEIGHT,
     FEATURE_COL,
     HORIZON_STEPS,
@@ -137,6 +143,13 @@ from src.autoscaler import (  # noqa: E402
     _load_and_prepare,
     _split_three_way,
     shadow,
+)
+from src.autoscaler.actuator import ActuationError, get_current_replicas  # noqa: E402
+from src.autoscaler.metrics_source import (  # noqa: E402
+    DEFAULT_PROMETHEUS_URL,
+    PrometheusMetricsSource,
+    PrometheusMetricsSourceError,
+    resample_readings,
 )
 from src.autoscaler.shadow_store import ShadowStore, record_and_evaluate  # noqa: E402
 
@@ -261,6 +274,12 @@ async def lifespan(app: FastAPI):
             daemon=True, name="live-forecasting-loop",
         )
         live_loop_thread.start()
+        # Kept as the SAME object `run_scheduler_loop` mutates every tick
+        # (see LiveLoopConfig's own docstring) -- reading its two
+        # leading-underscore runtime-state fields from a request handler
+        # (see /actuation/status below) reflects the live circuit-breaker
+        # state, not a snapshot taken at startup.
+        _state["loop_cfg"] = loop_cfg
         if enable_actuation:
             print(f"[startup] Live forecasting loop started against {_PROMETHEUS_URL} "
                   f"(tick={tick_seconds}s). ACTUATION ENABLED for machine="
@@ -291,6 +310,23 @@ app = FastAPI(
     ),
     version="0.1.0",
     lifespan=lifespan,
+)
+
+# The React frontend (Vite dev server, or a static build served from a
+# different origin) calls this API cross-origin. No cookie/session auth
+# exists anywhere in this service to protect (every route above is
+# unauthenticated read/write already), so a wildcard origin doesn't widen
+# this service's real attack surface -- it only stops the browser from
+# blocking a request `curl`/`requests` could already make freely.
+# LSTM_AUTOSCALER_CORS_ORIGINS overrides with a comma-separated allowlist
+# for a deployment that wants one.
+_cors_origins_env = os.environ.get("LSTM_AUTOSCALER_CORS_ORIGINS", "").strip()
+_cors_origins = [o.strip() for o in _cors_origins_env.split(",") if o.strip()] or ["*"]
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=_cors_origins,
+    allow_methods=["*"],
+    allow_headers=["*"],
 )
 
 
@@ -636,4 +672,180 @@ def shadow_decisions(machine_id: str, limit: int = 500) -> ObservedDecisionListR
     return ObservedDecisionListResponse(
         machine_id=machine_id,
         decisions=_shadow_store.get_observed_decisions(machine_id, limit=limit),
+    )
+
+
+# ── New: thin REST wrappers around existing in-process-only functions ────────
+# (React frontend build) `actuator.get_current_replicas` and
+# `PrometheusMetricsSource.fetch_readings`/`list_machine_ids` were, until
+# now, only ever called in-process by src/dashboard/live_app.py -- no route
+# exposed them to an out-of-process caller. Each endpoint below is a thin,
+# direct wrapper around an already-existing, already-tested function; no
+# new scoring/decision/actuation logic lives here.
+
+class ReplicasResponse(BaseModel):
+    deployment: str
+    namespace: str
+    replicas: int
+    checked_at: str
+
+
+@app.get("/replicas/{deployment}", response_model=ReplicasResponse, tags=["cluster"])
+def replicas(deployment: str, namespace: str = "lstm-autoscaler") -> ReplicasResponse:
+    """Current replica count of a real Deployment, read live via the local/
+    in-cluster kubeconfig (`actuator.get_current_replicas`, unmodified --
+    reads the `deployments/scale` subresource only). Never a scaling call."""
+    try:
+        count = get_current_replicas(deployment, namespace)
+    except ActuationError as e:
+        raise HTTPException(status_code=503, detail=str(e)) from e
+    return ReplicasResponse(
+        deployment=deployment, namespace=namespace, replicas=count,
+        checked_at=datetime.now(timezone.utc).isoformat(),
+    )
+
+
+class CpuReading(BaseModel):
+    timestamp: str
+    cpu_pct: float
+
+
+class CpuMetricsResponse(BaseModel):
+    machine_id: str
+    prometheus_url: str
+    resample_minutes: int
+    readings: List[CpuReading]
+
+
+@app.get("/metrics/cpu", response_model=CpuMetricsResponse, tags=["cluster"])
+def metrics_cpu(
+    machine_id: str,
+    prometheus_url: str = _PROMETHEUS_URL or DEFAULT_PROMETHEUS_URL,
+    hours: float = 2.0,
+) -> CpuMetricsResponse:
+    """Real per-node CPU% history for `machine_id` over the last `hours`,
+    via `PrometheusMetricsSource.fetch_readings` + `resample_readings`
+    (both unmodified -- the same two calls `live_app.py` made in-process).
+    Empty `readings` (not an error) if the node has no data in range --
+    matches `MetricsSource.fetch_readings`'s own documented contract."""
+    try:
+        source = PrometheusMetricsSource(prometheus_url=prometheus_url)
+        now = datetime.now(timezone.utc)
+        raw = source.fetch_readings(machine_id, now - timedelta(hours=hours), now)
+    except (_requests.exceptions.RequestException, PrometheusMetricsSourceError) as e:
+        raise HTTPException(status_code=502, detail=f"Prometheus query failed: {e}") from e
+    df = resample_readings(raw)
+    readings = (
+        [
+            CpuReading(timestamp=ts.isoformat(), cpu_pct=round(float(val), 4))
+            for ts, val in df[FEATURE_COL].items()
+        ]
+        if not df.empty else []
+    )
+    return CpuMetricsResponse(
+        machine_id=machine_id, prometheus_url=prometheus_url,
+        resample_minutes=5, readings=readings,
+    )
+
+
+class MachinesResponse(BaseModel):
+    prometheus_url: str
+    machines: List[str]
+
+
+@app.get("/machines", response_model=MachinesResponse, tags=["cluster"])
+def machines(prometheus_url: str = _PROMETHEUS_URL or DEFAULT_PROMETHEUS_URL) -> MachinesResponse:
+    """Every node currently visible to Prometheus right now
+    (`PrometheusMetricsSource.list_machine_ids`, unmodified) -- lets the
+    frontend populate a machine selector from the real cluster instead of
+    a hardcoded list."""
+    try:
+        source = PrometheusMetricsSource(prometheus_url=prometheus_url)
+        ids = source.list_machine_ids()
+    except (_requests.exceptions.RequestException, PrometheusMetricsSourceError) as e:
+        raise HTTPException(status_code=502, detail=f"Prometheus query failed: {e}") from e
+    return MachinesResponse(prometheus_url=prometheus_url, machines=ids)
+
+
+class ScalingConfigResponse(BaseModel):
+    server_capacity_pct: float
+    min_servers: int
+    max_servers: int
+    scale_step: int
+    over_prov_weight: float
+    under_prov_weight: float
+    safety_margin: float
+    demand_scale: float
+    tick_seconds: int
+
+
+@app.get("/config", response_model=ScalingConfigResponse, tags=["ops"])
+def scaling_config() -> ScalingConfigResponse:
+    """The effective scaling-decision thresholds this service is actually
+    running with right now -- the real values `_decide_scaling` and the
+    live loop use, not a hardcoded guess in the frontend. Reflects env-var
+    overrides when the live loop is running; falls back to this module's
+    code defaults otherwise (e.g. local dev with no Prometheus configured).
+    None of these are runtime-editable via this API -- they're Python
+    constants / startup env vars, exactly as before this endpoint existed."""
+    loop_cfg = _state.get("loop_cfg")
+    return ScalingConfigResponse(
+        server_capacity_pct=DEC_SERVER_CAPACITY,
+        min_servers=DEC_MIN_SERVERS,
+        max_servers=DEC_MAX_SERVERS,
+        scale_step=DEC_SCALE_STEP,
+        over_prov_weight=DEC_OVER_WEIGHT,
+        under_prov_weight=loop_cfg.under_prov_weight if loop_cfg else DEC_UNDER_WEIGHT,
+        safety_margin=loop_cfg.safety_margin if loop_cfg else SAFETY_MARGIN,
+        demand_scale=loop_cfg.demand_scale if loop_cfg else DEMAND_SCALE,
+        tick_seconds=loop_cfg.tick_seconds if loop_cfg else 300,
+    )
+
+
+class ActuationStatusResponse(BaseModel):
+    enabled: bool
+    machine_id: Optional[str] = None
+    deployment: Optional[str] = None
+    namespace: Optional[str] = None
+    circuit_breaker_threshold: Optional[int] = None
+    circuit_breaker_cooldown_seconds: Optional[float] = None
+    consecutive_failures: int = 0
+    circuit_open: bool = False
+    circuit_opened_at: Optional[str] = None
+    cooldown_remaining_seconds: Optional[float] = None
+
+
+@app.get("/actuation/status", response_model=ActuationStatusResponse, tags=["ops"])
+def actuation_status() -> ActuationStatusResponse:
+    """Live real-actuation config + circuit-breaker state (Step 26 / Step
+    26 follow-up), read directly off the SAME `LiveLoopConfig` object
+    `run_scheduler_loop` mutates every tick -- not a snapshot taken at
+    startup. `enabled=False` (every other field at its default) if the
+    live loop isn't running, or actuation was never turned on -- both
+    ordinary, non-error states."""
+    loop_cfg = _state.get("loop_cfg")
+    if loop_cfg is None or not loop_cfg.enable_actuation:
+        return ActuationStatusResponse(enabled=False)
+
+    failures = loop_cfg._actuation_consecutive_failures
+    opened_at = loop_cfg._actuation_circuit_opened_at
+    circuit_open = False
+    cooldown_remaining = None
+    if opened_at is not None:
+        elapsed = datetime.now(timezone.utc) - opened_at
+        if elapsed < loop_cfg.actuation_circuit_breaker_cooldown:
+            circuit_open = True
+            cooldown_remaining = (loop_cfg.actuation_circuit_breaker_cooldown - elapsed).total_seconds()
+
+    return ActuationStatusResponse(
+        enabled=True,
+        machine_id=loop_cfg.actuation_machine_id,
+        deployment=loop_cfg.actuation_deployment,
+        namespace=loop_cfg.actuation_namespace,
+        circuit_breaker_threshold=loop_cfg.actuation_circuit_breaker_threshold,
+        circuit_breaker_cooldown_seconds=loop_cfg.actuation_circuit_breaker_cooldown.total_seconds(),
+        consecutive_failures=failures,
+        circuit_open=circuit_open,
+        circuit_opened_at=opened_at.isoformat() if opened_at else None,
+        cooldown_remaining_seconds=cooldown_remaining,
     )

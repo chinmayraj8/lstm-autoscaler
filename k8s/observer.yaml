@@ -82,7 +82,7 @@ spec:
       serviceAccountName: lstm-autoscaler-observer
       containers:
         - name: observer
-          image: localhost:5000/lstm-autoscaler-observer:step26
+          image: localhost:5000/lstm-autoscaler-observer:frontend-api-20260914
           # CORRECTION: Docker Desktop's Kubernetes does NOT actually share
           # `docker build`'s image store with the cluster -- kubelet reads
           # images from containerd's `k8s.io` namespace, while `docker

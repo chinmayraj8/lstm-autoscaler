@@ -1,0 +1,169 @@
+import { Panel, PanelHeader, Section } from "@/components/section"
+import { Button } from "@/components/ui/button"
+import { Input } from "@/components/ui/input"
+import { Label } from "@/components/ui/label"
+import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select"
+import { Slider } from "@/components/ui/slider"
+import { Switch } from "@/components/ui/switch"
+import { useHealth, useMachines, useScalingConfig } from "@/hooks/queries"
+import { useSettings } from "@/lib/settings"
+
+export default function SettingsPage() {
+  const { settings, setSettings, resetSettings } = useSettings()
+  const machines = useMachines()
+  const health = useHealth()
+  const config = useScalingConfig()
+
+  return (
+    <div className="max-w-2xl space-y-6">
+      <div>
+        <h1 className="text-lg font-semibold">Settings</h1>
+        <p className="mt-1 text-sm text-muted-foreground">
+          Connection and polling settings for this browser only &mdash; not shared, not backend configuration.
+        </p>
+      </div>
+
+      <Section title="Connection">
+        <Panel className="space-y-4 p-4">
+          <div className="space-y-1.5">
+            <Label htmlFor="observer-url">Observer service URL</Label>
+            <Input
+              id="observer-url"
+              value={settings.observerUrl}
+              onChange={(e) => setSettings({ observerUrl: e.target.value })}
+              className="font-mono text-sm"
+              placeholder="http://localhost:8000"
+            />
+            <p className="text-xs text-muted-foreground">
+              Reached via <code className="font-mono">kubectl port-forward svc/lstm-autoscaler-observer -n lstm-autoscaler 8000:80</code>
+            </p>
+          </div>
+
+          <div className="space-y-1.5">
+            <Label htmlFor="prometheus-url">Prometheus URL</Label>
+            <Input
+              id="prometheus-url"
+              value={settings.prometheusUrl}
+              onChange={(e) => setSettings({ prometheusUrl: e.target.value })}
+              className="font-mono text-sm"
+              placeholder="http://kube-prometheus-stack-prometheus.monitoring.svc.cluster.local:9090"
+            />
+            <p className="text-xs text-muted-foreground">
+              Called server-side by the observer pod (<code className="font-mono">/metrics/cpu</code>,{" "}
+              <code className="font-mono">/machines</code>), not by your browser &mdash; use Prometheus&rsquo;s
+              in-cluster Service DNS name here, not a localhost port-forward address.
+            </p>
+          </div>
+
+          <div className="space-y-1.5">
+            <Label htmlFor="machine-id">Machine</Label>
+            <div className="flex gap-2">
+              {machines.data?.machines.length ? (
+                <Select value={settings.machineId} onValueChange={(v) => v && setSettings({ machineId: v })}>
+                  <SelectTrigger id="machine-id" className="w-full font-mono text-sm">
+                    <SelectValue />
+                  </SelectTrigger>
+                  <SelectContent>
+                    {machines.data.machines.map((id) => (
+                      <SelectItem key={id} value={id} className="font-mono text-sm">
+                        {id}
+                      </SelectItem>
+                    ))}
+                  </SelectContent>
+                </Select>
+              ) : (
+                <Input
+                  id="machine-id"
+                  value={settings.machineId}
+                  onChange={(e) => setSettings({ machineId: e.target.value })}
+                  className="font-mono text-sm"
+                />
+              )}
+            </div>
+            <p className="text-xs text-muted-foreground">
+              {machines.isError
+                ? "Could not discover nodes from Prometheus — enter a machine ID manually."
+                : "Discovered live from Prometheus; falls back to manual entry if unreachable."}
+            </p>
+          </div>
+        </Panel>
+      </Section>
+
+      <Section title="Monitoring">
+        <Panel className="space-y-4 p-4">
+          <div className="flex items-center justify-between">
+            <div>
+              <Label htmlFor="auto-refresh">Auto-refresh</Label>
+              <p className="text-xs text-muted-foreground">Poll the API on the interval below.</p>
+            </div>
+            <Switch
+              id="auto-refresh"
+              checked={settings.autoRefresh}
+              onCheckedChange={(checked) => setSettings({ autoRefresh: checked })}
+            />
+          </div>
+
+          <div className="space-y-2">
+            <div className="flex justify-between">
+              <Label>Refresh interval</Label>
+              <span className="font-mono text-sm text-primary">{settings.refreshIntervalSeconds}s</span>
+            </div>
+            <Slider
+              value={[settings.refreshIntervalSeconds]}
+              min={15}
+              max={120}
+              step={5}
+              onValueChange={(v) => {
+                const next = Array.isArray(v) ? v[0] : v
+                if (typeof next === "number") setSettings({ refreshIntervalSeconds: next })
+              }}
+              disabled={!settings.autoRefresh}
+            />
+          </div>
+
+          <div className="flex items-center justify-between">
+            <div>
+              <Label htmlFor="cpu-trend">Show real CPU trend</Label>
+              <p className="text-xs text-muted-foreground">Needs the observer to reach Prometheus at the URL above.</p>
+            </div>
+            <Switch
+              id="cpu-trend"
+              checked={settings.showCpuTrend}
+              onCheckedChange={(checked) => setSettings({ showCpuTrend: checked })}
+            />
+          </div>
+        </Panel>
+      </Section>
+
+      <Section title="Effective backend configuration" description="Read-only &mdash; these are Python constants / startup env vars on the observer, not editable from here">
+        <Panel>
+          <PanelHeader title="/config + /health" />
+          <dl className="grid grid-cols-2 gap-3 p-4 font-mono text-xs sm:grid-cols-3">
+            <Row label="Server capacity" value={config.data ? `${config.data.server_capacity_pct}%/replica` : "—"} />
+            <Row label="Replica bounds" value={config.data ? `${config.data.min_servers}–${config.data.max_servers}` : "—"} />
+            <Row label="Scale step" value={config.data ? `±${config.data.scale_step}/tick` : "—"} />
+            <Row label="Safety margin" value={config.data ? `${(config.data.safety_margin * 100).toFixed(0)}%` : "—"} />
+            <Row label="Tick interval" value={config.data ? `${config.data.tick_seconds}s` : "—"} />
+            <Row label="Under-prov weight" value={config.data ? String(config.data.under_prov_weight) : "—"} />
+            <Row label="LSTM model loaded" value={health.data ? String(health.data.lstm_model_loaded) : "—"} />
+            <Row label="Live loop running" value={health.data ? String(health.data.live_loop_running) : "—"} />
+            <Row label="Observer started" value={health.data ? new Date(health.data.started_at).toLocaleString() : "—"} />
+          </dl>
+        </Panel>
+      </Section>
+
+      <Button variant="outline" size="sm" onClick={resetSettings}>
+        Reset to defaults
+      </Button>
+    </div>
+  )
+}
+
+function Row({ label, value }: { label: string; value: string }) {
+  return (
+    <div>
+      <div className="text-[10px] uppercase text-muted-foreground">{label}</div>
+      <div>{value}</div>
+    </div>
+  )
+}
