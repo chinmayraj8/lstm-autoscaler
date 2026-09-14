@@ -1,6 +1,5 @@
-# LSTM Autoscaler — UIP 17
+# LSTM Autoscaler
 Cost-Aware Predictive Autoscaling using LSTM-Based Load Forecasting.
-Built for Unisys Innovation Program 17.
 
 ## Setup
 1. Install Python 3.11
