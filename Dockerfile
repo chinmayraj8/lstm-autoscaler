@@ -7,10 +7,10 @@
 # broader "Part 2" Docker/Kubernetes deployment work -- no /forecast model
 # serving is expected to run from this image (see LSTM_AUTOSCALER_SKIP_LSTM_MODEL
 # below; lstm_model.keras and the training CSV are both excluded via
-# .dockerignore), no multi-stage build, no non-root user hardening, no
-# health-check tuning beyond what k8s/observer.yaml's probes need. Still
-# observe-only: nothing in this image calls a real scaling API -- see
-# live_loop.py's and main.py's own module docstrings.
+# .dockerignore), no multi-stage build, no health-check tuning beyond what
+# k8s/observer.yaml's probes need. Still observe-only: nothing in this
+# image calls a real scaling API -- see live_loop.py's and main.py's own
+# module docstrings.
 FROM python:3.11-slim
 
 WORKDIR /app
@@ -20,10 +20,20 @@ RUN pip install --no-cache-dir -r requirements.txt
 
 COPY src/ src/
 
+# Non-root (security hardening pass): everything this process writes at
+# runtime lives under /data (the shadow-state PVC mount, see
+# LSTM_AUTOSCALER_SHADOW_DB/LSTM_AUTOSCALER_HYBRID_MODEL_DIR in
+# k8s/observer.yaml) or /tmp -- nothing under /app needs write access once
+# the image is built, so chown is really just "let appuser read what's
+# already here," not "grant it a writable app directory."
+RUN useradd -u 1000 -m appuser && chown -R appuser:appuser /app
+
 # LSTM_AUTOSCALER_SKIP_LSTM_MODEL and LSTM_AUTOSCALER_PROMETHEUS_URL are set
 # in k8s/observer.yaml, not baked in here -- keeps this image reusable for
 # local testing against a port-forwarded Prometheus too (see progress doc).
 ENV PYTHONUNBUFFERED=1
 EXPOSE 8000
+
+USER appuser
 
 CMD ["uvicorn", "src.api.main:app", "--host", "0.0.0.0", "--port", "8000"]

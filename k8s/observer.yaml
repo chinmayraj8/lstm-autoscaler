@@ -4,12 +4,15 @@
 # + the /shadow/* FastAPI endpoints continuously inside the cluster,
 # talking to Prometheus via in-cluster DNS -- not the broader Part 2
 # Docker/Kubernetes deployment work. No HorizontalPodAutoscaler, no
-# NetworkPolicy, no Ingress, no resource-limit tuning beyond a sane
-# starting guess, no RBAC (this service only ever makes outbound HTTP GETs
-# to Prometheus -- it never talks to the Kubernetes API, so no
-# ServiceAccount/Role is needed). A separate namespace from `monitoring` on
-# purpose: this is a new, independent workload, not part of the
-# kube-prometheus-stack release.
+# Ingress, no resource-limit tuning beyond a sane starting guess.
+# CORRECTION (security hardening pass): the line that used to be here --
+# "no RBAC, this service never talks to the Kubernetes API" -- stopped
+# being true the moment Step 26 added real actuation. This pod DOES now
+# have a ServiceAccount (see k8s/actuation-rbac.yaml, get/patch on
+# deployments/scale only) and DOES talk to the real Kubernetes API server.
+# A NetworkPolicy is included below for exactly that reason. A separate
+# namespace from `monitoring` on purpose: this is a new, independent
+# workload, not part of the kube-prometheus-stack release.
 #
 # BEFORE APPLYING: build the image, then push it to a registry the
 # cluster can actually see -- on a `docker-desktop` Kubernetes context
@@ -80,9 +83,89 @@ spec:
       # Harmless to leave set even with actuation disabled -- an unused
       # ServiceAccount grants nothing by itself if actuation never fires.
       serviceAccountName: lstm-autoscaler-observer
+      # Pod-level fsGroup: kept as the portable, generally-correct thing to
+      # declare (kubelet chgrp's + chmod g+rwX's most volume types to this
+      # GID on mount, and appuser's group -- see Dockerfile's `useradd` --
+      # is also 1000), but it is a documented no-op for THIS cluster's
+      # actual volume: `kubectl get pv <name> -o yaml` shows
+      # observer-shadow-state is backed by a plain `hostPath`
+      # (local-path-provisioner), and Kubernetes' own docs are explicit
+      # that fsGroup ownership management does not apply to hostPath
+      # volumes. Confirmed the hard way: this alone did NOT fix the
+      # failure below, the initContainer did.
+      securityContext:
+        fsGroup: 1000
+      # This PVC has real pre-existing data written back when this
+      # container ran as root -- shadow_state.db on disk was
+      # `-rw-r--r-- root root`, so switching the main container to a
+      # non-root UID left it able to READ that file but not WRITE to it
+      # (confirmed on the first real rollout of this hardening pass:
+      # sqlite3.OperationalError: attempt to write a readonly database --
+      # nothing to do with readOnlyRootFilesystem itself, which only
+      # governs the root FS, not this PVC mount). A brief, root-only
+      # initContainer -- the one place in this whole manifest that still
+      # runs as root, and only for as long as one `chown` takes -- fixes
+      # ownership once. Idempotent: on every future pod start this is just
+      # a no-op chown of already-1000-owned files.
+      initContainers:
+        - name: fix-data-permissions
+          image: localhost:5000/lstm-autoscaler-observer:security-20260914
+          command: ["chown", "-R", "1000:1000", "/data"]
+          # `drop: ["ALL"]` alone strips CAP_CHOWN even from UID 0 --
+          # confirmed the hard way, `chown` failed with "Operation not
+          # permitted" as root until CAP_CHOWN was added back explicitly.
+          # Least privilege even for the one root process in this
+          # manifest: root, but with ONLY the capability this single
+          # command actually needs, nothing else.
+          securityContext:
+            runAsUser: 0
+            runAsNonRoot: false
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop: ["ALL"]
+              add: ["CHOWN"]
+          volumeMounts:
+            - name: shadow-state
+              mountPath: /data
       containers:
         - name: observer
-          image: localhost:5000/lstm-autoscaler-observer:metrics-20260914
+          # THIRD CORRECTION (security hardening pass): ATTEMPTED a digest
+          # pin here (`@sha256:...`) instead of a mutable tag, from this
+          # exact build --
+          #   docker push localhost:5000/lstm-autoscaler-observer:security-20260914
+          #   -> Docker-Content-Digest: sha256:03549fad511becaf6dc2f6a7cb7ea353e4c506213e5953418ef4425e446e6102
+          # (confirmed against the registry's own manifest API, and `docker
+          # pull` of that exact digest succeeds from this machine) -- but
+          # this specific Docker Desktop Kubernetes node could not actually
+          # USE it: its containerd resolves image references through an
+          # internal `registry-mirror:1273` proxy, and a HEAD request for
+          # ANY digest reference against this local registry (the manifest
+          # list's own digest above, and separately the platform-specific
+          # linux/arm64 manifest digest underneath it) 500s through that
+          # mirror -- `kubectl describe pod` showed
+          # "unexpected status from HEAD request to
+          # http://registry-mirror:1273/v2/.../manifests/sha256:...:
+          # 500 Internal Server Error" for both, while the identical tag
+          # reference pulls fine. Verified, not assumed, before reverting.
+          #
+          # HONESTY CHECK, stated plainly rather than implied: even where
+          # digest pinning DOES work, this is a throwaway, unauthenticated
+          # `registry:2` container on localhost:5000 -- anyone with docker
+          # access to this machine can push a different image under the
+          # same tag, or run their own registry and have this cluster pull
+          # from it. A digest pin would demonstrate the PRACTICE (this
+          # exact, verified set of bytes, not "whatever a tag happens to
+          # resolve to today"), never real supply-chain provenance -- that
+          # needs a signed, content-addressed image in an actual registry
+          # with access control, which this local setup deliberately isn't
+          # and, on this node, currently can't even mechanically pull by
+          # digest regardless. The unique-tag-per-build discipline the
+          # SECOND CORRECTION below already established is the practical
+          # substitute here: not equivalent to a real digest pin, but it
+          # gets the same "this reference can't silently point at
+          # different bytes" property in practice, since a tag is never
+          # reused across builds.
+          image: localhost:5000/lstm-autoscaler-observer:security-20260914
           # CORRECTION: Docker Desktop's Kubernetes does NOT actually share
           # `docker build`'s image store with the cluster -- kubelet reads
           # images from containerd's `k8s.io` namespace, while `docker
@@ -206,9 +289,30 @@ spec:
             # LSTM_AUTOSCALER_ACTUATION_DEPLOYMENT / _NAMESPACE are left at
             # their defaults (demo-workload / lstm-autoscaler) and don't
             # need setting unless you rename k8s/demo-workload.yaml's target.
+          # Security hardening pass: drop everything the container doesn't
+          # actually need. runAsUser: 1000 matches the Dockerfile's own
+          # `useradd -u 1000 appuser`. readOnlyRootFilesystem is safe here
+          # specifically BECAUSE the only two real write paths
+          # (shadow_state.db, the hybrid-model dir) already live on the
+          # `shadow-state` PVC mount below, not on the root filesystem --
+          # confirmed by checking every LSTM_AUTOSCALER_* path this
+          # container writes to. The `tmp` emptyDir exists purely
+          # defensively: Python/TensorFlow/uvicorn can want scratch space
+          # under /tmp, and a read-only root FS turns "wanted to write a
+          # temp file" into a startup crash that's annoying to root-cause
+          # from a CrashLoopBackOff with no other symptom.
+          securityContext:
+            readOnlyRootFilesystem: true
+            runAsNonRoot: true
+            runAsUser: 1000
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop: ["ALL"]
           volumeMounts:
             - name: shadow-state
               mountPath: /data
+            - name: tmp
+              mountPath: /tmp
           readinessProbe:
             httpGet:
               path: /health
@@ -246,6 +350,8 @@ spec:
         - name: shadow-state
           persistentVolumeClaim:
             claimName: observer-shadow-state
+        - name: tmp
+          emptyDir: {}
 ---
 apiVersion: v1
 kind: Service
@@ -311,3 +417,104 @@ spec:
       bearerTokenSecret:
         name: lstm-autoscaler-api-token
         key: token
+---
+# Default-deny NetworkPolicy: an empty `ingress`/`egress` list under a
+# matching `policyTypes` entry means "deny everything not explicitly
+# allowed below," not "no policy" -- this pod gets exactly the following
+# and nothing else.
+#
+# HONESTY CHECK, same spirit as the digest-pin comment on the Deployment
+# above: this cluster is Docker Desktop's built-in Kubernetes, which runs
+# on `kind` under the hood with `kindnet` as its CNI (confirmed via
+# `kubectl get pods -n kube-system` -- the `kindnet-*` DaemonSet, no
+# Calico/Cilium/Antrea anywhere). kindnet does NOT implement the
+# NetworkPolicy API at all -- kind's own docs are explicit about this.
+# Applying this file is accepted by the API server and IS a real object,
+# but on THIS cluster today it enforces nothing; every rule below is
+# correct and would take effect immediately on a NetworkPolicy-capable CNI
+# (Calico, Cilium, etc.), but here it's a documented intent, not an active
+# control. Verified, not assumed: after applying, the pod's egress to
+# Prometheus and the API server, and Prometheus's scrape of it, all kept
+# working exactly as before -- which is itself the evidence this policy
+# isn't actually being enforced here, not proof that it's correctly
+# permissive (a real enforcement pass would need a NetworkPolicy-capable
+# CNI to actually test against).
+#
+# Ingress: ONLY the real Prometheus scrape (monitoring namespace, the
+# same pod selector kube-prometheus-stack-prometheus's own Service uses)
+# on the container port. The frontend reaches this pod exclusively via
+# `kubectl port-forward`, which tunnels through the API server/kubelet
+# directly into the pod's network namespace -- it never traverses the pod
+# network the CNI enforces NetworkPolicy on, so it needs no ingress rule
+# here and none is added.
+#
+# Egress: DNS (CoreDNS, kube-system) -- without this, a default-deny
+# egress policy silently breaks every Service DNS lookup this pod makes,
+# including the two rules below; Prometheus (monitoring namespace) on
+# 9090, for PrometheusMetricsSource's real history reads; and the
+# Kubernetes API server for actuator.py's real get/patch calls (Step 26).
+# The API server's Service (`kubernetes.default.svc`) has NO selector --
+# traffic to its ClusterIP gets DNAT'd to the control-plane node's real
+# IP:port before a podSelector/namespaceSelector peer could ever match it
+# -- so this uses an `ipBlock` for that real endpoint instead (from
+# `kubectl get endpoints kubernetes -n default`). That IP is this
+# cluster's own control-plane node address and is NOT portable to a
+# different cluster; re-check it if this cluster is ever torn down and
+# recreated, not just restarted.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: lstm-autoscaler-observer
+  namespace: lstm-autoscaler
+spec:
+  podSelector:
+    matchLabels:
+      app: lstm-autoscaler-observer
+  policyTypes:
+    - Ingress
+    - Egress
+  ingress:
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: monitoring
+          podSelector:
+            matchLabels:
+              app.kubernetes.io/name: prometheus
+              operator.prometheus.io/name: kube-prometheus-stack-prometheus
+      ports:
+        - protocol: TCP
+          port: 8000
+  egress:
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: kube-system
+          podSelector:
+            matchLabels:
+              k8s-app: kube-dns
+      ports:
+        - protocol: UDP
+          port: 53
+        - protocol: TCP
+          port: 53
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: monitoring
+          podSelector:
+            matchLabels:
+              app.kubernetes.io/name: prometheus
+              operator.prometheus.io/name: kube-prometheus-stack-prometheus
+      ports:
+        - protocol: TCP
+          port: 9090
+    - to:
+        # The real kube-apiserver endpoint on THIS cluster (control-plane
+        # node IP:6443) -- see the comment above on why an ipBlock, not a
+        # selector, is what's needed here.
+        - ipBlock:
+            cidr: 172.18.0.4/32
+      ports:
+        - protocol: TCP
+          port: 6443
