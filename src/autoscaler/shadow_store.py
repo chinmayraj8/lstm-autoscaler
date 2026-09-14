@@ -59,7 +59,7 @@ from contextlib import contextmanager
 from datetime import datetime
 from typing import Callable, List, Optional, Tuple
 
-from . import shadow
+from . import instrumentation, shadow
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS machines (
@@ -434,6 +434,20 @@ def run_shadow_cycle(store: ShadowStore, machine_id: str, now: datetime,
 
     if "window" in pulled:
         store._save_new_window(machine_id, pulled["window"], recorded_at=now)
+        # Cumulative-cost gauge (GET /metrics) -- the SAME totals
+        # /shadow/{machine_id} already reports (shadow.cumulative_summary
+        # over the FULL banked history, not just this state's capped
+        # `keep_last_n` window_results), refreshed the instant a new
+        # window actually banks rather than only on request.
+        full_history = store.get_full_window_history(machine_id)
+        cumulative = shadow.cumulative_summary(full_history)
+        if cumulative["n_windows"] > 0:
+            instrumentation.SHADOW_WINDOW_COST.labels(machine_id=machine_id, forecaster="arima").set(
+                cumulative["arima_cost_total"]
+            )
+            instrumentation.SHADOW_WINDOW_COST.labels(machine_id=machine_id, forecaster="hybrid").set(
+                cumulative["hybrid_cost_total"]
+            )
     if state.last_evaluated_at != old_last_evaluated:
         store._save_last_evaluated(machine_id, state.last_evaluated_at)
     if change is not None:

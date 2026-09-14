@@ -94,7 +94,7 @@ from typing import Callable, List, Optional, Sequence, Tuple
 import numpy as np
 from sklearn.preprocessing import MinMaxScaler
 
-from . import config, shadow
+from . import config, instrumentation, shadow
 from .arima_baseline import ARIMA_ORDER, _arima_forecast_once, _arima_rolling_forecast, _inv_flat
 from .decision import DecisionConfig, _decide_scaling
 from .metrics_source import MetricsSource, resample_readings
@@ -281,6 +281,10 @@ def observe_node_once(machine_id: str, source: MetricsSource, store: ShadowStore
         forecast_cpu_pct=forecast_list, planned_load_pct=planned_load_pct,
         current_servers=current_servers, recommended_servers=recommended_servers, action=action,
     )
+    instrumentation.DECISIONS_TOTAL.labels(
+        machine_id=machine_id, forecaster=forecaster, action=action.split(" ", 1)[0],
+    ).inc()
+    instrumentation.RECOMMENDED_SERVERS.labels(machine_id=machine_id).set(recommended_servers)
     logger.info(
         "live_loop: observed machine=%s forecaster=%s forecast=%s planned_load=%.2f%% "
         "current=%d recommended=%d action=%s",
@@ -516,6 +520,7 @@ def run_tick(store: ShadowStore, source: MetricsSource, machine_ids: Sequence[st
                     # column earlier in this loop iteration.
                     store.set_last_recommended_servers(machine_id, recommended)
                     summary["actuated"].append(machine_id)
+                    instrumentation.ACTUATION_TOTAL.labels(machine_id=machine_id, result="success").inc()
                     # A real success closes the breaker outright, whether this
                     # was ordinary operation or a post-cooldown probe attempt.
                     cfg._actuation_consecutive_failures = 0
@@ -523,11 +528,19 @@ def run_tick(store: ShadowStore, source: MetricsSource, machine_ids: Sequence[st
                 except actuator.ActuationError as e:
                     logger.warning("live_loop: %s -- actuation skipped this tick", e)
                     summary["actuation_skipped"].append(machine_id)
+                    instrumentation.ACTUATION_TOTAL.labels(machine_id=machine_id, result="failure").inc()
                     _record_actuation_failure(cfg, machine_id, now)
                 except Exception:
                     logger.exception("live_loop: actuation failed for machine=%s", machine_id)
                     summary["actuation_skipped"].append(machine_id)
+                    instrumentation.ACTUATION_TOTAL.labels(machine_id=machine_id, result="failure").inc()
                     _record_actuation_failure(cfg, machine_id, now)
+
+            breaker_open_now = (
+                cfg._actuation_circuit_opened_at is not None
+                and now - cfg._actuation_circuit_opened_at < cfg.actuation_circuit_breaker_cooldown
+            )
+            instrumentation.CIRCUIT_BREAKER_OPEN.labels(machine_id=machine_id).set(1.0 if breaker_open_now else 0.0)
 
         state = store.load_state(machine_id)
         if state.current_forecaster != "hybrid":

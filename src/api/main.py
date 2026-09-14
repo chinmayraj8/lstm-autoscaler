@@ -100,7 +100,7 @@ from typing import List, Optional
 
 import numpy as np
 import requests as _requests
-from fastapi import Depends, FastAPI, Header, HTTPException
+from fastapi import Depends, FastAPI, Header, HTTPException, Response
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 from sklearn.preprocessing import MinMaxScaler
@@ -148,6 +148,7 @@ from src.autoscaler import (  # noqa: E402
 )
 from src.autoscaler.actuator import ActuationError, get_current_replicas  # noqa: E402
 from src.autoscaler.arima_baseline import ARIMA_ORDER, _arima_forecast_with_ci  # noqa: E402
+from src.autoscaler.instrumentation import CONTENT_TYPE_LATEST, render_metrics  # noqa: E402
 from src.autoscaler.live_loop import DEFAULT_FIT_LOOKBACK_HOURS, MIN_FIT_POINTS  # noqa: E402
 from src.autoscaler.metrics_source import (  # noqa: E402
     DEFAULT_PROMETHEUS_URL,
@@ -479,6 +480,19 @@ def health() -> HealthResponse:
         horizon_minutes=HORIZON_STEPS * 5,
         started_at=_state["started_at"],
     )
+
+
+@app.get("/metrics", tags=["ops"], dependencies=[Depends(require_auth)])
+def metrics() -> Response:
+    """Prometheus text-exposition-format scrape endpoint (see
+    src/autoscaler/instrumentation.py for exactly what's tracked and from
+    where -- observed decisions, the live loop's recommended-replica
+    ledger, real actuation attempts, actuation circuit-breaker state, and
+    cumulative shadow-window cost per forecaster). Behind the same bearer
+    token as every other route except GET /health -- k8s/observer.yaml's
+    ServiceMonitor reads that token from the same lstm-autoscaler-api-token
+    Secret already used elsewhere, via `bearerTokenSecret`."""
+    return Response(content=render_metrics(), media_type=CONTENT_TYPE_LATEST)
 
 
 @app.post("/forecast", response_model=ForecastResponse, tags=["inference"], dependencies=[Depends(require_auth)])

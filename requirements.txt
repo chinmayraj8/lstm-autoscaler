@@ -28,3 +28,8 @@ requests==2.33.1
 # so it ships in every build of this image, same reasoning as tensorflow
 # above.
 kubernetes==36.0.3
+# GET /metrics (src/autoscaler/instrumentation.py) -- real Prometheus-format
+# instrumentation, always a live import-time dependency of live_loop.py/
+# shadow_store.py (they update these metrics at the same points they
+# already log/persist real state), not gated behind any env var.
+prometheus_client==0.24.1

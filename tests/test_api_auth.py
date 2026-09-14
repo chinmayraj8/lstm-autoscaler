@@ -47,6 +47,13 @@ def test_protected_route_200_with_correct_token():
     assert r.status_code == 200
 
 
+def test_metrics_route_returns_prometheus_text_format_with_correct_token():
+    r = client.get("/metrics", headers={"Authorization": f"Bearer {TEST_TOKEN}"})
+    assert r.status_code == 200
+    assert r.headers["content-type"].startswith("text/plain")
+    assert "autoscaler_decisions_total" in r.text
+
+
 def test_protected_route_401_for_malformed_authorization_header():
     # A header that isn't "Bearer <token>" at all (e.g. Basic auth, or the
     # raw token with no scheme) must not be treated as a bearer token.
@@ -64,6 +71,7 @@ def test_protected_route_401_for_malformed_authorization_header():
         ("get", "/shadow/m_never_seen/windows"),
         ("get", "/shadow/m_never_seen/decisions"),
         ("get", "/metrics/cpu?machine_id=m_test"),
+        ("get", "/metrics"),
         ("get", "/forecast/confidence?machine_id=m_test"),
     ],
 )

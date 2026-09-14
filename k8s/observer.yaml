@@ -82,7 +82,7 @@ spec:
       serviceAccountName: lstm-autoscaler-observer
       containers:
         - name: observer
-          image: localhost:5000/lstm-autoscaler-observer:forecast-ci-20260914
+          image: localhost:5000/lstm-autoscaler-observer:metrics-20260914
           # CORRECTION: Docker Desktop's Kubernetes does NOT actually share
           # `docker build`'s image store with the cluster -- kubelet reads
           # images from containerd's `k8s.io` namespace, while `docker
@@ -252,10 +252,62 @@ kind: Service
 metadata:
   name: lstm-autoscaler-observer
   namespace: lstm-autoscaler
+  labels:
+    app: lstm-autoscaler-observer
 spec:
   selector:
     app: lstm-autoscaler-observer
   ports:
-    - port: 80
+    # Named so the ServiceMonitor below can reference it by name instead of
+    # by number -- required for a ServiceMonitor endpoint's `port` field.
+    - name: http
+      port: 80
       targetPort: 8000
   type: ClusterIP
+---
+# Scrapes GET /metrics (src/autoscaler/instrumentation.py) via the
+# Prometheus Operator's usual discovery mechanism, instead of hand-editing
+# kube-prometheus-stack's prometheus.yml directly -- this cluster runs the
+# Operator (confirmed: `kubectl get prometheus -n monitoring` returns a
+# CR), so a ServiceMonitor is the idiomatic way to add a scrape target.
+#
+# Must live in the SAME namespace as the Service it targets (lstm-autoscaler,
+# not monitoring) so `bearerTokenSecret` below can resolve the
+# lstm-autoscaler-api-token Secret -- cross-namespace secret references
+# aren't supported by the ServiceMonitor CRD. `namespaceSelector` still
+# needs to explicitly list lstm-autoscaler for the Operator's Prometheus-
+# config generator to actually look there for the target Service.
+#
+# `release: kube-prometheus-stack` matches this cluster's real Prometheus
+# CR's `spec.serviceMonitorSelector.matchLabels` (checked via
+# `kubectl get prometheus -n monitoring -o yaml`) -- required, or this
+# ServiceMonitor is silently ignored rather than erroring.
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: lstm-autoscaler-observer
+  namespace: lstm-autoscaler
+  labels:
+    release: kube-prometheus-stack
+spec:
+  selector:
+    matchLabels:
+      app: lstm-autoscaler-observer
+  namespaceSelector:
+    matchNames:
+      - lstm-autoscaler
+  endpoints:
+    - port: http
+      path: /metrics
+      interval: 30s
+      # Requires the Secret to actually exist first:
+      #   kubectl create secret generic lstm-autoscaler-api-token \
+      #     -n lstm-autoscaler \
+      #     --from-literal=token="$(openssl rand -hex 32)"
+      # (the same Secret the Deployment above already reads
+      # LSTM_AUTOSCALER_API_TOKEN from) -- if it's ever deleted without
+      # updating this ServiceMonitor too, the target starts failing with
+      # 401s, not silently scraping unauthenticated.
+      bearerTokenSecret:
+        name: lstm-autoscaler-api-token
+        key: token
