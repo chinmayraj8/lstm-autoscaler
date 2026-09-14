@@ -1,7 +1,19 @@
 import { cn } from "@/lib/utils"
-import { parseAction, type Forecaster } from "@/lib/types"
+import { parseAction, type ObservedForecaster } from "@/lib/types"
 
-export function ForecasterBadge({ forecaster }: { forecaster: Forecaster }) {
+export function ForecasterBadge({ forecaster }: { forecaster: ObservedForecaster }) {
+  if (forecaster === "reactive_fallback") {
+    return (
+      <span
+        className={cn(
+          "inline-flex items-center rounded-sm border px-1.5 py-0.5 font-mono text-[11px] font-medium",
+          "border-status-warning/30 bg-status-warning/10 text-status-warning",
+        )}
+      >
+        reactive fallback
+      </span>
+    )
+  }
   const isHybrid = forecaster === "hybrid"
   return (
     <span

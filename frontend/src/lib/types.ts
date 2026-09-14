@@ -19,6 +19,13 @@ export interface HealthResponse {
 
 export type Forecaster = "arima" | "hybrid"
 
+/** ObservedDecision.forecaster can additionally be "reactive_fallback" --
+ * the live loop's ARIMA-fit-failure fallback (real CPU data fetched, but
+ * ARIMA itself couldn't forecast). Assignment fields (AssignmentChange,
+ * ShadowStatusResponse) stay Forecaster-only -- they can never legitimately
+ * be the fallback value. */
+export type ObservedForecaster = Forecaster | "reactive_fallback"
+
 export interface CumulativeSummary {
   n_windows: number
   arima_cost_mean?: number
@@ -64,7 +71,7 @@ export interface ShadowWindowListResponse {
 
 export interface ObservedDecision {
   observed_at: string
-  forecaster: Forecaster
+  forecaster: ObservedForecaster
   forecast_cpu_pct: number[]
   planned_load_pct: number
   current_servers: number

@@ -18,6 +18,7 @@ import pytest
 
 from src.autoscaler import config
 from src.autoscaler.live_loop import (
+    REACTIVE_FALLBACK_FORECASTER,
     HybridModelUnavailable,
     LiveLoopConfig,
     _build_hybrid_window,
@@ -26,9 +27,10 @@ from src.autoscaler.live_loop import (
     run_scheduler_loop,
     run_tick,
 )
-from src.autoscaler.metrics_source import StaticMetricsSource, synthetic_readings_series
+from src.autoscaler.metrics_source import StaticMetricsSource, resample_readings, synthetic_readings_series
 from src.autoscaler.shadow import AssignmentChange
 from src.autoscaler.shadow_store import ShadowStore
+from src.autoscaler.simulation import _reactive_decide_once
 
 T0 = datetime(2026, 1, 1)
 
@@ -103,6 +105,138 @@ def test_observe_node_once_carries_shadow_server_count_forward():
     r2 = observe_node_once("m_test", source, store, T0 + timedelta(hours=3, minutes=5), cfg)
 
     assert r2["current_servers"] == r1["recommended_servers"]
+
+
+# ── observe_node_once: the two DIFFERENT failure modes ─────────────────────
+# Prometheus-fetch failure (no real data at all) must stay completely
+# unchanged: caught only by run_tick's own try/except, never inside
+# observe_node_once, never triggering the reactive fallback. An ARIMA
+# fit/forecast failure on real data that WAS fetched successfully is the
+# actual new behavior: fall back to the reactive threshold policy instead
+# of producing no decision.
+
+class _PrometheusDownSource(StaticMetricsSource):
+    """Simulates Prometheus unreachable with its own retry/backoff already
+    exhausted -- fetch_readings itself raises, exactly what a real
+    PrometheusMetricsSource does after Step 22's retry loop gives up."""
+
+    def fetch_readings(self, machine_id, start, end):
+        raise RuntimeError("prometheus unreachable")
+
+
+def test_observe_node_once_does_not_catch_a_prometheus_fetch_failure():
+    # Regression guard: this failure mode is deliberately NOT changed by
+    # the reactive fallback -- there's no real data at all here for any
+    # policy to act on, so it must propagate out of observe_node_once
+    # uncaught (run_tick is what catches it -- see the next test).
+    source = _PrometheusDownSource({"m_test": synthetic_readings_series(T0, n_points=60, cadence_minutes=5)})
+    store = ShadowStore(":memory:")
+    cfg = LiveLoopConfig(fit_lookback_hours=2.0)
+
+    with pytest.raises(RuntimeError, match="prometheus unreachable"):
+        observe_node_once("m_test", source, store, T0 + timedelta(hours=3), cfg)
+
+    assert store.get_observed_decisions("m_test") == []
+
+
+def test_run_tick_still_skips_the_tick_on_a_prometheus_fetch_failure():
+    # Same regression guard, through run_tick's own catch-all -- must stay
+    # byte-for-byte the pre-existing "log it, skip the tick, no decision,
+    # no actuation" behavior for this path.
+    source = _PrometheusDownSource({"m_a": synthetic_readings_series(T0, n_points=60, cadence_minutes=5)})
+    store = ShadowStore(":memory:")
+    cfg = LiveLoopConfig(fit_lookback_hours=2.0, enable_actuation=True, actuation_machine_id="m_a")
+
+    with patch("src.autoscaler.actuator.set_replicas") as fake_set:
+        summary = run_tick(store, source, ["m_a"], T0 + timedelta(hours=3), cfg)
+
+    fake_set.assert_not_called()
+    assert summary["observed"] == []
+    assert summary["skipped"] == ["m_a"]
+    assert summary["actuated"] == []
+    assert summary["actuation_skipped"] == []
+    assert store.get_observed_decisions("m_a") == []
+
+
+def test_observe_node_once_falls_back_to_reactive_when_arima_fails():
+    source = _source(n_hours=4)
+    store = ShadowStore(":memory:")
+    now = T0 + timedelta(hours=3)
+    cfg = LiveLoopConfig(fit_lookback_hours=2.0)
+
+    with patch("src.autoscaler.live_loop._arima_forecast_once", side_effect=RuntimeError("numerical issue")):
+        result = observe_node_once("m_test", source, store, now, cfg)
+
+    assert result is not None
+    assert result["forecaster"] == REACTIVE_FALLBACK_FORECASTER
+    assert result["forecast_cpu_pct"] == []  # no fabricated forecast
+
+    # Recompute independently, from the SAME real data this tick actually
+    # fetched, what the reactive policy should have said -- not just "some
+    # decision came out".
+    raw = source.fetch_readings("m_test", now - timedelta(hours=cfg.fit_lookback_hours), now)
+    resampled = resample_readings(raw)
+    current_cpu_pct = float(resampled[config.FEATURE_COL].values[-1])
+    expected_action, expected_servers = _reactive_decide_once(
+        current_cpu_pct, config.SIM_INITIAL_SERVERS, demand_scale=cfg.demand_scale,
+    )
+    assert result["action"] == expected_action
+    assert result["recommended_servers"] == expected_servers
+    assert result["planned_load_pct"] == round(current_cpu_pct * cfg.demand_scale, 4)
+
+    logged = store.get_observed_decisions("m_test")
+    assert len(logged) == 1
+    assert logged[0]["forecaster"] == REACTIVE_FALLBACK_FORECASTER
+    assert logged[0]["forecast_cpu_pct"] == []
+    assert logged[0]["recommended_servers"] == expected_servers
+
+
+def test_run_tick_actuates_on_a_reactive_fallback_decision():
+    # The actual point of this feature: a degraded-but-working tick must
+    # still be eligible for real actuation, exactly like a normal ARIMA
+    # decision -- same enable_actuation gate, same allow-list, same
+    # circuit breaker. get_current_replicas is mocked to match the
+    # ledger's default so reconciliation is a no-op, isolating this
+    # test from that unrelated behavior (see the module comment above the
+    # reconciliation tests).
+    source = _source(n_hours=4, machine_id="m_a")
+    store = ShadowStore(":memory:")
+    now = T0 + timedelta(hours=3)
+    cfg = LiveLoopConfig(
+        fit_lookback_hours=2.0, enable_actuation=True, actuation_machine_id="m_a",
+        actuation_deployment="demo-workload", actuation_namespace="lstm-autoscaler",
+    )
+
+    with patch("src.autoscaler.live_loop._arima_forecast_once", side_effect=RuntimeError("numerical issue")), \
+         patch("src.autoscaler.actuator.get_current_replicas", return_value=config.SIM_INITIAL_SERVERS), \
+         patch("src.autoscaler.actuator.set_replicas") as fake_set:
+        summary = run_tick(store, source, ["m_a"], now, cfg)
+
+    assert summary["observed"] == ["m_a"]
+    assert summary["actuated"] == ["m_a"]
+    assert summary["actuation_skipped"] == []
+    assert summary["reconciled"] == []
+
+    decision = store.get_observed_decisions("m_a")[0]
+    assert decision["forecaster"] == REACTIVE_FALLBACK_FORECASTER
+    fake_set.assert_called_once_with("demo-workload", "lstm-autoscaler", decision["recommended_servers"])
+
+
+def test_reactive_fallback_is_per_tick_not_a_sticky_mode():
+    source = _source(n_hours=6)
+    store = ShadowStore(":memory:")
+    cfg = LiveLoopConfig(fit_lookback_hours=2.0)
+
+    with patch("src.autoscaler.live_loop._arima_forecast_once", side_effect=RuntimeError("numerical issue")):
+        r1 = observe_node_once("m_test", source, store, T0 + timedelta(hours=3), cfg)
+    assert r1["forecaster"] == REACTIVE_FALLBACK_FORECASTER
+
+    # ARIMA "recovers" -- no patch this time -- on the very next tick.
+    r2 = observe_node_once("m_test", source, store, T0 + timedelta(hours=3, minutes=5), cfg)
+    assert r2["forecaster"] == "arima"
+
+    logged = store.get_observed_decisions("m_test")
+    assert [d["forecaster"] for d in logged] == [REACTIVE_FALLBACK_FORECASTER, "arima"]
 
 
 # ── run_tick: two separate paths ────────────────────────────────────────────

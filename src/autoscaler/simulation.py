@@ -115,3 +115,47 @@ def _reactive_autoscaler(demand_series, sim_cfg,
             active = max(active - 1, 1)
         targets.append(active)
     return np.array(targets)
+
+
+def _reactive_decide_once(current_cpu_pct: float, current_servers: int,
+                          demand_scale: float = config.DEMAND_SCALE,
+                          scale_up_threshold: float = config.REACTIVE_UP_THRESHOLD,
+                          scale_down_threshold: float = config.REACTIVE_DOWN_THRESHOLD,
+                          min_servers: int = config.DEC_MIN_SERVERS,
+                          max_servers: int = config.DEC_MAX_SERVERS,
+                          scale_step: int = config.DEC_SCALE_STEP) -> Tuple[str, int]:
+    """One-tick equivalent of `_reactive_autoscaler`'s per-step rule
+    (live_loop.py's ARIMA-failure fallback). `_reactive_autoscaler` above
+    is built for offline replay over a whole series and always starts
+    from `SimConfig.initial_servers` -- not "wherever the real fleet
+    actually is right now". This takes a single current real CPU reading
+    plus the current real replica count directly, applies the IDENTICAL
+    `demand = current_cpu_pct * demand_scale` / `load_per_server = demand
+    / current_servers` threshold rule against the SAME
+    `config.REACTIVE_UP_THRESHOLD`/`REACTIVE_DOWN_THRESHOLD` constants
+    (no new thresholds), and returns `(action, recommended_servers)` in
+    the exact string convention `decision._decide_scaling` uses ("hold" |
+    "scale_up +N" | "scale_down -N"), so a caller/log line/the frontend
+    treats this identically to an ARIMA-produced decision.
+
+    `min_servers`/`max_servers`/`scale_step` default to the live decision
+    engine's own bounds (`config.DEC_*`), not `_reactive_autoscaler`'s
+    hardcoded 1/10 above -- both currently equal the same values, but
+    this keeps the fallback honestly bounded by the same real system
+    limits the primary policy uses, not a second, coincidentally-matching
+    set of magic numbers.
+    """
+    demand = current_cpu_pct * demand_scale
+    load_per_server = demand / current_servers
+    if load_per_server > scale_up_threshold:
+        new_servers = min(current_servers + scale_step, max_servers)
+    elif load_per_server < scale_down_threshold:
+        new_servers = max(current_servers - scale_step, min_servers)
+    else:
+        new_servers = current_servers
+
+    if new_servers > current_servers:
+        return f"scale_up +{new_servers - current_servers}", new_servers
+    if new_servers < current_servers:
+        return f"scale_down -{current_servers - new_servers}", new_servers
+    return "hold", current_servers

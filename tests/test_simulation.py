@@ -6,11 +6,13 @@ No TensorFlow needed -- pure numpy/dataclass logic.
 
 import numpy as np
 
+from src.autoscaler import config
 from src.autoscaler.decision import DecisionConfig
 from src.autoscaler.simulation import (
     SimConfig,
     _compute_cost_score,
     _reactive_autoscaler,
+    _reactive_decide_once,
     _run_simulation,
 )
 
@@ -103,3 +105,72 @@ def test_reactive_autoscaler_clamps_between_one_and_ten():
     demand = np.array([100_000.0])  # would want to scale up far past 10
     targets = _reactive_autoscaler(demand, sim_cfg, scale_up_threshold=80, scale_down_threshold=30)
     assert targets[0] == 10
+
+
+# ── _reactive_decide_once (live_loop.py's ARIMA-failure fallback) ──────────
+# Same threshold rule as _reactive_autoscaler above, applied once against a
+# real current reading/replica count instead of looping over a whole
+# offline series from SimConfig.initial_servers.
+
+def test_reactive_decide_once_scales_up_above_threshold():
+    # current_servers=2, cpu=10% -> demand=10*20=200, load=200/2=100 > 80
+    action, servers = _reactive_decide_once(
+        current_cpu_pct=10.0, current_servers=2,
+        demand_scale=20.0, scale_up_threshold=80.0, scale_down_threshold=30.0,
+    )
+    assert action == "scale_up +1"
+    assert servers == 3
+
+
+def test_reactive_decide_once_scales_down_below_threshold():
+    # current_servers=4, cpu=2% -> demand=2*20=40, load=40/4=10 < 30
+    action, servers = _reactive_decide_once(
+        current_cpu_pct=2.0, current_servers=4,
+        demand_scale=20.0, scale_up_threshold=80.0, scale_down_threshold=30.0,
+    )
+    assert action == "scale_down -1"
+    assert servers == 3
+
+
+def test_reactive_decide_once_holds_within_the_band():
+    # current_servers=3, cpu=5% -> demand=5*20=100, load=100/3=33.3, between 30 and 80
+    action, servers = _reactive_decide_once(
+        current_cpu_pct=5.0, current_servers=3,
+        demand_scale=20.0, scale_up_threshold=80.0, scale_down_threshold=30.0,
+    )
+    assert action == "hold"
+    assert servers == 3
+
+
+def test_reactive_decide_once_clamps_at_max_servers():
+    action, servers = _reactive_decide_once(
+        current_cpu_pct=100.0, current_servers=config.DEC_MAX_SERVERS,
+        demand_scale=20.0, scale_up_threshold=80.0, scale_down_threshold=30.0,
+        max_servers=config.DEC_MAX_SERVERS,
+    )
+    # Already at the ceiling -- clamped target equals current, so this is
+    # a "hold", not a "scale_up" that silently does nothing.
+    assert action == "hold"
+    assert servers == config.DEC_MAX_SERVERS
+
+
+def test_reactive_decide_once_clamps_at_min_servers():
+    action, servers = _reactive_decide_once(
+        current_cpu_pct=0.1, current_servers=config.DEC_MIN_SERVERS,
+        demand_scale=20.0, scale_up_threshold=80.0, scale_down_threshold=30.0,
+        min_servers=config.DEC_MIN_SERVERS,
+    )
+    assert action == "hold"
+    assert servers == config.DEC_MIN_SERVERS
+
+
+def test_reactive_decide_once_defaults_reuse_the_real_config_constants():
+    # No thresholds/bounds passed explicitly -- must reuse
+    # config.REACTIVE_UP_THRESHOLD/_DOWN_THRESHOLD and config.DEC_* rather
+    # than a fresh set of magic numbers, per this function's own contract.
+    action, servers = _reactive_decide_once(current_cpu_pct=10.0, current_servers=2)
+    demand = 10.0 * config.DEMAND_SCALE
+    expected_up = demand / 2 > config.REACTIVE_UP_THRESHOLD
+    assert expected_up  # sanity check on the fixture itself
+    assert action == f"scale_up +{config.DEC_SCALE_STEP}"
+    assert servers == 2 + config.DEC_SCALE_STEP

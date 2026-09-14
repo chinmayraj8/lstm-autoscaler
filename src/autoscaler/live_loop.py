@@ -38,6 +38,15 @@ this module refuses to do. Instead:
    `ShadowStore.record_observed_decision` -- a new, simpler log, separate
    from the shadow-window tables. This is "watch real decisions
    accumulate," the thing this stage's own instructions asked to expose.
+   Graceful degradation (Step 22 follow-up): if real history was fetched
+   fine but the ARIMA fit/forecast step itself throws, this falls back to
+   the reactive threshold policy (`simulation._reactive_decide_once`) on
+   the current real reading rather than skipping the tick entirely --
+   logged as `forecaster=REACTIVE_FALLBACK_FORECASTER`, still eligible
+   for real actuation exactly like an ARIMA decision (same gate, same
+   allow-list, same circuit breaker), per-tick rather than sticky. A
+   Prometheus-fetch failure is a different, NOT-changed failure mode --
+   see that function's own docstring.
 2. **The hybrid shadow-window path** (`_build_hybrid_window` +
    `shadow_store.run_shadow_cycle`) -- runs ONLY for nodes ALREADY assigned
    to the hybrid (`state.current_forecaster == "hybrid"`), per this stage's
@@ -90,6 +99,7 @@ from .arima_baseline import ARIMA_ORDER, _arima_forecast_once, _arima_rolling_fo
 from .decision import DecisionConfig, _decide_scaling
 from .metrics_source import MetricsSource, resample_readings
 from .shadow_store import ShadowStore, run_shadow_cycle
+from .simulation import _reactive_decide_once
 
 logger = logging.getLogger("autoscaler.live_loop")
 
@@ -109,6 +119,13 @@ TRACKED_NODES_ENV_VAR = "LSTM_AUTOSCALER_TRACKED_NODES"
 # ARIMA(2,0,1) needs more observations than its own parameter count to fit
 # at all; this is a floor well above that, not a tight statistical bound.
 MIN_FIT_POINTS = config.LOOKBACK_STEPS + 2
+
+# Marks an observed decision produced by the reactive-threshold fallback
+# (real CPU data was fetched, but the ARIMA fit/forecast step itself
+# failed) instead of "arima" -- deliberately distinguishable in
+# `/shadow/{id}/decisions` and the frontend rather than looking like a
+# normal ARIMA tick. See `observe_node_once`'s docstring.
+REACTIVE_FALLBACK_FORECASTER = "reactive_fallback"
 
 
 class HybridModelUnavailable(Exception):
@@ -182,20 +199,40 @@ class LiveLoopConfig:
 
 def observe_node_once(machine_id: str, source: MetricsSource, store: ShadowStore, now: datetime,
                       cfg: LiveLoopConfig = LiveLoopConfig()) -> Optional[dict]:
-    """One node's one-tick ARIMA observation. Pulls `cfg.fit_lookback_hours`
-    of real history via `source` (`fetch_readings` + `resample_readings`,
-    both unmodified from Steps 20-21), fits+forecasts ARIMA
+    """One node's one-tick observation. Pulls `cfg.fit_lookback_hours` of
+    real history via `source` (`fetch_readings` + `resample_readings`,
+    both unmodified from Steps 20-21) -- a failure HERE (Prometheus
+    unreachable, its own retry/backoff already exhausted) is NOT caught
+    in this function; it propagates to `run_tick`'s own try/except
+    exactly as before, since there is no real data at all for ANY policy
+    to act on. Returns None (logging a warning, not raising) if there
+    wasn't enough real data this tick to fit ARIMA at all -- a real
+    scrape gap or a brand-new node are both legitimate reasons, same
+    convention `MetricsSource.fetch_readings` already established for an
+    empty result.
+
+    With real data in hand, fits+forecasts ARIMA
     (`arima_baseline._arima_forecast_once`, built from the identical
-    `ARIMA(...).fit()` call `_arima_rolling_forecast` already uses), and
+    `ARIMA(...).fit()` call `_arima_rolling_forecast` already uses) and
     runs the SAME scaling decision the `/forecast` endpoint computes
-    (`decision._decide_scaling`, unmodified) -- current_servers is a
-    logging-only "shadow" count carried forward via
-    `ShadowStore.get_last_recommended_servers`/`record_observed_decision`,
-    never a real fleet size. Logs the result and returns it as a dict, or
-    returns None (logging a warning, not raising) if there wasn't enough
-    real data this tick to fit ARIMA at all -- a real scrape gap or a
-    brand-new node are both legitimate reasons, same convention
-    `MetricsSource.fetch_readings` already established for an empty result.
+    (`decision._decide_scaling`, unmodified). If THAT step itself raises
+    (a numerical issue, insufficient variance, whatever -- distinct from
+    the Prometheus-fetch failure above, which this function never even
+    sees), falls back to the reactive threshold policy
+    (`simulation._reactive_decide_once`) on the most recent real reading
+    instead of producing no decision at all -- there IS real, current
+    data, just no working forecast. Logged and recorded with
+    `forecaster=REACTIVE_FALLBACK_FORECASTER`, clearly distinguishable
+    from a real "arima" tick in `/shadow/{id}/decisions` and the
+    frontend, with an empty `forecast_cpu_pct` -- there is no forecast to
+    report, and fabricating one (e.g. repeating the current reading
+    across the horizon) would be dishonest. This fallback is per-tick,
+    not sticky: the very next tick tries ARIMA again from scratch.
+
+    `current_servers` is a logging-only "shadow" count carried forward
+    via `ShadowStore.get_last_recommended_servers`/`record_observed_
+    decision`, never a real fleet size, regardless of which policy this
+    tick used.
     """
     start = now - timedelta(hours=cfg.fit_lookback_hours)
     raw = source.fetch_readings(machine_id, start, now)
@@ -209,31 +246,49 @@ def observe_node_once(machine_id: str, source: MetricsSource, store: ShadowStore
         )
         return None
 
-    scaler = MinMaxScaler(feature_range=(0, 1))
-    scaled = scaler.fit_transform(flat.reshape(-1, 1)).flatten()
-
-    forecast_scaled = _arima_forecast_once(scaled, config.HORIZON_STEPS, cfg.order)
-    forecast_real = scaler.inverse_transform(forecast_scaled.reshape(-1, 1)).flatten()
-
-    planned_load = float(np.max(forecast_real)) * cfg.demand_scale * (1.0 + cfg.safety_margin)
-    dec_cfg = DecisionConfig(under_prov_weight=cfg.under_prov_weight)
     current_servers = store.get_last_recommended_servers(machine_id, default=config.SIM_INITIAL_SERVERS)
-    action, recommended_servers = _decide_scaling(current_servers, planned_load, dec_cfg)
 
-    forecast_list = [round(float(v), 4) for v in forecast_real]
+    try:
+        scaler = MinMaxScaler(feature_range=(0, 1))
+        scaled = scaler.fit_transform(flat.reshape(-1, 1)).flatten()
+
+        forecast_scaled = _arima_forecast_once(scaled, config.HORIZON_STEPS, cfg.order)
+        forecast_real = scaler.inverse_transform(forecast_scaled.reshape(-1, 1)).flatten()
+
+        planned_load = float(np.max(forecast_real)) * cfg.demand_scale * (1.0 + cfg.safety_margin)
+        dec_cfg = DecisionConfig(under_prov_weight=cfg.under_prov_weight)
+        action, recommended_servers = _decide_scaling(current_servers, planned_load, dec_cfg)
+
+        forecaster = "arima"
+        forecast_list = [round(float(v), 4) for v in forecast_real]
+        planned_load_pct = round(planned_load, 4)
+    except Exception:
+        logger.exception(
+            "live_loop: ARIMA fit/forecast failed for machine=%s on %d real points -- "
+            "falling back to the reactive threshold policy",
+            machine_id, len(flat),
+        )
+        current_cpu_pct = float(flat[-1])
+        action, recommended_servers = _reactive_decide_once(
+            current_cpu_pct, current_servers, demand_scale=cfg.demand_scale,
+        )
+        forecaster = REACTIVE_FALLBACK_FORECASTER
+        forecast_list = []
+        planned_load_pct = round(current_cpu_pct * cfg.demand_scale, 4)
+
     store.record_observed_decision(
-        machine_id, now, forecaster="arima",
-        forecast_cpu_pct=forecast_list, planned_load_pct=round(planned_load, 4),
+        machine_id, now, forecaster=forecaster,
+        forecast_cpu_pct=forecast_list, planned_load_pct=planned_load_pct,
         current_servers=current_servers, recommended_servers=recommended_servers, action=action,
     )
     logger.info(
-        "live_loop: observed machine=%s forecast=%s planned_load=%.2f%% "
+        "live_loop: observed machine=%s forecaster=%s forecast=%s planned_load=%.2f%% "
         "current=%d recommended=%d action=%s",
-        machine_id, forecast_list, planned_load, current_servers, recommended_servers, action,
+        machine_id, forecaster, forecast_list, planned_load_pct, current_servers, recommended_servers, action,
     )
     return {
-        "machine_id": machine_id, "forecast_cpu_pct": forecast_list,
-        "planned_load_pct": round(planned_load, 4), "current_servers": current_servers,
+        "machine_id": machine_id, "forecaster": forecaster, "forecast_cpu_pct": forecast_list,
+        "planned_load_pct": planned_load_pct, "current_servers": current_servers,
         "recommended_servers": recommended_servers, "action": action,
     }
 

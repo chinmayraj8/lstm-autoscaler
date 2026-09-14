@@ -3,12 +3,12 @@ import { Panel, PanelHeader, Section } from "@/components/section"
 import { ForecasterBadge, VerdictBadge } from "@/components/status/badges"
 import { useShadowDecisions, useShadowStatus } from "@/hooks/queries"
 import { formatDateTime } from "@/lib/format"
-import { parseAction } from "@/lib/types"
+import { parseAction, type ObservedForecaster } from "@/lib/types"
 import { useSettings } from "@/lib/settings"
 
 type Event =
   | { kind: "assignment"; timestamp: string; oldForecaster: string; newForecaster: string; verdict: string; evidence?: string }
-  | { kind: "scaling"; timestamp: string; forecaster: string; from: number; to: number; action: string }
+  | { kind: "scaling"; timestamp: string; forecaster: ObservedForecaster; from: number; to: number; action: string }
 
 export default function EventsPage() {
   const { settings } = useSettings()
@@ -77,7 +77,7 @@ export default function EventsPage() {
                   ) : (
                     <div className="flex items-center gap-2 text-sm">
                       <span className="text-muted-foreground">Scaling:</span>
-                      <ForecasterBadge forecaster={e.forecaster as "arima" | "hybrid"} />
+                      <ForecasterBadge forecaster={e.forecaster} />
                       <span className="font-mono text-xs">
                         {e.from} <ArrowRight className="inline h-3 w-3" /> {e.to} replicas
                       </span>
