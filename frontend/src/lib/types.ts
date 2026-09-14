@@ -113,6 +113,23 @@ export interface ScalingConfigResponse {
   tick_seconds: number
 }
 
+export interface ForecastPoint {
+  step_minutes: number
+  cpu_pct: number
+  lower_pct: number
+  upper_pct: number
+}
+
+export interface ForecastConfidenceResponse {
+  machine_id: string
+  observed_at: string
+  arima_order: number[]
+  confidence_level: number
+  fit_window_hours: number
+  fit_points: number
+  forecast: ForecastPoint[]
+}
+
 export interface ActuationStatusResponse {
   enabled: boolean
   machine_id: string | null

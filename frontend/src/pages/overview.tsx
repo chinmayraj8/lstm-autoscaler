@@ -7,6 +7,7 @@ import { StatusPill } from "@/components/status/status-dot"
 import { Skeleton } from "@/components/ui/skeleton"
 import {
   useCpuMetrics,
+  useForecastConfidence,
   useReplicas,
   useScalingConfig,
   useShadowDecisions,
@@ -27,6 +28,7 @@ export default function OverviewPage() {
   const cpu = useCpuMetrics(machineId, 2)
   const replicas = useReplicas()
   const config = useScalingConfig()
+  const forecastCi = useForecastConfidence(machineId)
 
   const latestDecision = decisions.data?.decisions.at(-1)
   const cumulative = shadowStatus.data?.cumulative
@@ -80,7 +82,10 @@ export default function OverviewPage() {
         <Section title="Actual vs. forecast" className="lg:col-span-2" description="Last 2 hours, next 15 minutes">
           <Panel>
             {cpu.data ? (
-              <EChart option={buildForecastOption(cpu.data.readings, decisions.data?.decisions ?? [], { compact: true })} height={220} />
+              <EChart
+                option={buildForecastOption(cpu.data.readings, decisions.data?.decisions ?? [], forecastCi.data ?? null, { compact: true })}
+                height={220}
+              />
             ) : (
               <div className="flex h-[220px] items-center justify-center text-sm text-muted-foreground">
                 {cpu.isError ? "Prometheus unreachable" : "Loading…"}

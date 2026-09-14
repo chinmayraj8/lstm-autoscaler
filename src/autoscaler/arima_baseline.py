@@ -245,6 +245,33 @@ def _arima_forecast_once(history_flat: np.ndarray, horizon: int, order=ARIMA_ORD
     return np.clip(fc, 0.0, 1.0)
 
 
+def _arima_forecast_with_ci(history_flat: np.ndarray, horizon: int, order=ARIMA_ORDER,
+                             alpha: float = 0.05):
+    """Like `_arima_forecast_once`, but also returns a REAL `(1 - alpha)`
+    confidence interval via statsmodels' `get_forecast().conf_int()` --
+    ARIMA's own estimated forecast-error variance, not a fabricated band.
+    Same fit procedure, same order convention, same scaled [0, 1] space as
+    every other function in this file; the caller still inverse-transforms
+    with its own `MinMaxScaler` (e.g. via `_inv_flat`).
+
+    `np.clip` is monotonic, so clipping `point`/`lower`/`upper` independently
+    to `[0, 1]` cannot invert their ordering.
+
+    Returns `(point_scaled, lower_scaled, upper_scaled)`, each shape
+    `(horizon,)`.
+    """
+    from statsmodels.tsa.arima.model import ARIMA
+
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        fit = ARIMA(history_flat, order=order).fit()
+        pred = fit.get_forecast(steps=horizon)
+        point = pred.predicted_mean
+        ci = np.asarray(pred.conf_int(alpha=alpha))
+
+    return np.clip(point, 0.0, 1.0), np.clip(ci[:, 0], 0.0, 1.0), np.clip(ci[:, 1], 0.0, 1.0)
+
+
 def _forecast_and_score(y_pred_scaled, y_true_scaled, scaler):
     """Inverse-transform + RMSE/MAE, mirroring forecasting._evaluate_lstm's return shape."""
     y_pred_real = _inv_flat(y_pred_scaled, scaler)

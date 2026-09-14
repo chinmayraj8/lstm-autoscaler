@@ -12,7 +12,7 @@ are exercised by experiments/run_arima_in_sim.py, not here.
 import numpy as np
 from sklearn.preprocessing import MinMaxScaler
 
-from src.autoscaler.arima_baseline import _arima_rolling_forecast, _inv_flat
+from src.autoscaler.arima_baseline import _arima_forecast_with_ci, _arima_rolling_forecast, _inv_flat
 from src.autoscaler.data import _make_sequences
 
 ORDER = (1, 0, 0)
@@ -79,6 +79,55 @@ def test_arima_rolling_forecast_predictions_clipped_to_unit_interval():
 
     assert (y_pred >= 0.0).all()
     assert (y_pred <= 1.0).all()
+
+
+def test_arima_forecast_with_ci_bounds_straddle_the_point_forecast():
+    # Real statistical claim: the interval must actually contain its own
+    # point forecast at every horizon step -- not just be "some numbers".
+    series = _synthetic_series(n=60)
+    horizon = 3
+
+    point, lower, upper = _arima_forecast_with_ci(series, horizon, ORDER, alpha=0.05)
+
+    assert point.shape == lower.shape == upper.shape == (horizon,)
+    assert (lower <= point).all()
+    assert (point <= upper).all()
+
+
+def test_arima_forecast_with_ci_narrows_as_confidence_level_drops():
+    # A 50% interval (alpha=0.5) must be strictly narrower than a 95% one
+    # (alpha=0.05) for the same fit -- the real behavior of a Gaussian
+    # prediction interval, not an arbitrary assertion.
+    series = _synthetic_series(n=60)
+    horizon = 3
+
+    _, lower_95, upper_95 = _arima_forecast_with_ci(series, horizon, ORDER, alpha=0.05)
+    _, lower_50, upper_50 = _arima_forecast_with_ci(series, horizon, ORDER, alpha=0.50)
+
+    width_95 = upper_95 - lower_95
+    width_50 = upper_50 - lower_50
+    assert (width_50 < width_95).all()
+
+
+def test_arima_forecast_with_ci_predictions_clipped_to_unit_interval():
+    series = _synthetic_series(n=60)
+
+    point, lower, upper = _arima_forecast_with_ci(series, 3, ORDER, alpha=0.05)
+
+    for arr in (point, lower, upper):
+        assert (arr >= 0.0).all()
+        assert (arr <= 1.0).all()
+
+
+def test_arima_forecast_with_ci_is_deterministic():
+    series = _synthetic_series(n=60)
+
+    point_1, lower_1, upper_1 = _arima_forecast_with_ci(series, 3, ORDER, alpha=0.05)
+    point_2, lower_2, upper_2 = _arima_forecast_with_ci(series, 3, ORDER, alpha=0.05)
+
+    np.testing.assert_array_equal(point_1, point_2)
+    np.testing.assert_array_equal(lower_1, lower_2)
+    np.testing.assert_array_equal(upper_1, upper_2)
 
 
 def test_inv_flat_matches_manual_scaler_inverse_transform():

@@ -102,6 +102,7 @@ import requests as _requests
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
+from sklearn.preprocessing import MinMaxScaler
 
 # Step 25: without a configured handler, the `autoscaler.*` module loggers
 # (shadow.py, live_loop.py -- every logger.info/.warning/.exception call
@@ -145,6 +146,8 @@ from src.autoscaler import (  # noqa: E402
     shadow,
 )
 from src.autoscaler.actuator import ActuationError, get_current_replicas  # noqa: E402
+from src.autoscaler.arima_baseline import ARIMA_ORDER, _arima_forecast_with_ci  # noqa: E402
+from src.autoscaler.live_loop import DEFAULT_FIT_LOOKBACK_HOURS, MIN_FIT_POINTS  # noqa: E402
 from src.autoscaler.metrics_source import (  # noqa: E402
     DEFAULT_PROMETHEUS_URL,
     PrometheusMetricsSource,
@@ -848,4 +851,104 @@ def actuation_status() -> ActuationStatusResponse:
         circuit_open=circuit_open,
         circuit_opened_at=opened_at.isoformat() if opened_at else None,
         cooldown_remaining_seconds=cooldown_remaining,
+    )
+
+
+# ── Real confidence-interval forecast ────────────────────────────────────────
+# Ground truth (backend audit, React frontend build): neither this service's
+# /forecast (the LSTM path) nor the live loop's ARIMA observation
+# (`arima_baseline._arima_forecast_once`) has ever computed a prediction
+# interval anywhere -- only a point forecast. This endpoint closes that gap
+# for ARIMA specifically, using statsmodels' own `get_forecast().conf_int()`
+# (`arima_baseline._arima_forecast_with_ci`, new) -- a real, principled
+# interval derived from the fitted model's own forecast-error variance, not
+# a fabricated band. Computed fresh per request (same fit-and-forecast
+# primitive `observe_node_once` uses each tick, same real Prometheus
+# history) -- nothing here is persisted to `_shadow_store`, and it never
+# touches the live loop's own ticking, decisions, or actuation.
+
+class ForecastPoint(BaseModel):
+    step_minutes: int
+    cpu_pct: float
+    lower_pct: float
+    upper_pct: float
+
+
+class ForecastConfidenceResponse(BaseModel):
+    machine_id: str
+    observed_at: str
+    arima_order: List[int]
+    confidence_level: float
+    fit_window_hours: float
+    fit_points: int
+    forecast: List[ForecastPoint]
+
+
+@app.get("/forecast/confidence", response_model=ForecastConfidenceResponse, tags=["inference"])
+def forecast_confidence(
+    machine_id: str,
+    prometheus_url: str = _PROMETHEUS_URL or DEFAULT_PROMETHEUS_URL,
+    fit_hours: float = DEFAULT_FIT_LOOKBACK_HOURS,
+    confidence_level: float = 0.95,
+) -> ForecastConfidenceResponse:
+    """A real `confidence_level` (default 95%) prediction interval around
+    ARIMA's `horizon_steps`-ahead point forecast for `machine_id`, fit
+    fresh on the last `fit_hours` of real Prometheus history -- the same
+    data source and fit procedure as the live loop's own per-tick ARIMA
+    observation (`live_loop.observe_node_once`), just with
+    `get_forecast().conf_int()` instead of `.forecast()`. Not persisted;
+    calling this repeatedly does not affect `/shadow/*` state.
+
+    422 if there isn't enough real history in the window to fit ARIMA at
+    all (a real scrape gap or a brand-new node) -- an empty/degraded
+    response would silently look like a valid, narrow interval, which
+    would be worse than a clear error here.
+    """
+    if not 0.0 < confidence_level < 1.0:
+        raise HTTPException(status_code=400, detail="confidence_level must be strictly between 0 and 1.")
+
+    try:
+        source = PrometheusMetricsSource(prometheus_url=prometheus_url)
+        now = datetime.now(timezone.utc)
+        raw = source.fetch_readings(machine_id, now - timedelta(hours=fit_hours), now)
+    except (_requests.exceptions.RequestException, PrometheusMetricsSourceError) as e:
+        raise HTTPException(status_code=502, detail=f"Prometheus query failed: {e}") from e
+
+    resampled = resample_readings(raw)
+    flat = resampled[FEATURE_COL].values.astype(np.float64)
+    if len(flat) < MIN_FIT_POINTS:
+        raise HTTPException(
+            status_code=422,
+            detail=(
+                f"only {len(flat)}/{MIN_FIT_POINTS} real points in the last {fit_hours:.1f}h for "
+                f"machine_id={machine_id!r} -- not enough real history to fit ARIMA."
+            ),
+        )
+
+    scaler = MinMaxScaler(feature_range=(0, 1))
+    scaled = scaler.fit_transform(flat.reshape(-1, 1)).flatten()
+
+    alpha = 1.0 - confidence_level
+    point_sc, lower_sc, upper_sc = _arima_forecast_with_ci(scaled, HORIZON_STEPS, ARIMA_ORDER, alpha)
+
+    point = scaler.inverse_transform(point_sc.reshape(-1, 1)).flatten()
+    lower = scaler.inverse_transform(lower_sc.reshape(-1, 1)).flatten()
+    upper = scaler.inverse_transform(upper_sc.reshape(-1, 1)).flatten()
+
+    return ForecastConfidenceResponse(
+        machine_id=machine_id,
+        observed_at=now.isoformat(),
+        arima_order=list(ARIMA_ORDER),
+        confidence_level=confidence_level,
+        fit_window_hours=fit_hours,
+        fit_points=len(flat),
+        forecast=[
+            ForecastPoint(
+                step_minutes=(i + 1) * 5,
+                cpu_pct=round(float(point[i]), 4),
+                lower_pct=round(float(lower[i]), 4),
+                upper_pct=round(float(upper[i]), 4),
+            )
+            for i in range(HORIZON_STEPS)
+        ],
     )

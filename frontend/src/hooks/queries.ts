@@ -86,6 +86,18 @@ export function useMachines() {
   })
 }
 
+export function useForecastConfidence(machineId: string, fitHours = 3, confidenceLevel = 0.95) {
+  const api = useApi()
+  const { settings } = useSettings()
+  const refetchInterval = useRefetchInterval()
+  return useQuery({
+    queryKey: ["forecast-confidence", api, machineId, settings.prometheusUrl, fitHours, confidenceLevel],
+    queryFn: () => api.forecastConfidence(machineId, settings.prometheusUrl, fitHours, confidenceLevel),
+    refetchInterval,
+    retry: 1,
+  })
+}
+
 export function useScalingConfig() {
   const api = useApi()
   return useQuery({

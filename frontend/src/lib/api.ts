@@ -1,6 +1,7 @@
 import type {
   ActuationStatusResponse,
   CpuMetricsResponse,
+  ForecastConfidenceResponse,
   HealthResponse,
   MachinesResponse,
   ObservedDecisionListResponse,
@@ -20,11 +21,17 @@ export class ApiError extends Error {
 
 /** A 404 from /shadow/{id} and /shadow/{id}/windows means "no shadow state
  * for this machine yet" -- an ordinary state (main.py's own documented
- * convention), not a failure. Callers that pass `treat404AsNull` get
- * `null` back instead of a thrown ApiError. */
-async function getJson<T>(url: string, opts: { treat404AsNull?: boolean } = {}): Promise<T | null> {
+ * convention), not a failure. A 422 from /forecast/confidence means "not
+ * enough real history to fit ARIMA yet" -- also ordinary. Callers that
+ * pass `treat404AsNull`/`treat422AsNull` get `null` back instead of a
+ * thrown ApiError for those specific statuses. */
+async function getJson<T>(
+  url: string,
+  opts: { treat404AsNull?: boolean; treat422AsNull?: boolean } = {},
+): Promise<T | null> {
   const res = await fetch(url)
   if (res.status === 404 && opts.treat404AsNull) return null
+  if (res.status === 422 && opts.treat422AsNull) return null
   if (!res.ok) {
     let detail = res.statusText
     try {
@@ -80,6 +87,17 @@ export function createApiClient(observerUrl: string) {
       getJson<MachinesResponse>(`${base}/machines${qs({ prometheus_url: prometheusUrl })}`),
 
     scalingConfig: () => getJson<ScalingConfigResponse>(`${base}/config`),
+
+    forecastConfidence: (machineId: string, prometheusUrl: string, fitHours = 3, confidenceLevel = 0.95) =>
+      getJson<ForecastConfidenceResponse>(
+        `${base}/forecast/confidence${qs({
+          machine_id: machineId,
+          prometheus_url: prometheusUrl,
+          fit_hours: fitHours,
+          confidence_level: confidenceLevel,
+        })}`,
+        { treat422AsNull: true },
+      ),
 
     actuationStatus: () => getJson<ActuationStatusResponse>(`${base}/actuation/status`),
   }
