@@ -6,3 +6,4 @@ venv/
 .ipynb_checkpoints/
 _to_delete/
 experiments/_tmp_*.keras
+docs/resume_draft.md
